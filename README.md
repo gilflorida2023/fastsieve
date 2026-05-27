@@ -19,7 +19,7 @@ For each window:
 2. For each stored base prime, walk its multiples within the window
    and mark them composite
 3. Scan the window for survivors — each survivor is a new prime
-4. Write discovered primes to the state file (optional)
+4. Buffer discovered primes in memory; flush to state file in 65K-entry batches
 
 ### mod-210 Wheel
 
@@ -82,7 +82,7 @@ Requires GCC or Clang on a 64-bit platform (for `__int128` support).
 ## Usage
 
 ```sh
-./fastsieve [buffer_size] [target] [-c] [-r] [-o file]
+./fastsieve [buffer_size] [target] [-c] [-s] [-r] [-o file]
 ```
 
 | Argument | Description |
@@ -90,6 +90,7 @@ Requires GCC or Clang on a 64-bit platform (for `__int128` support).
 | `buffer_size` | Segment window in natural numbers (optional, auto-optimized to ~143K) |
 | `target` | Sieve up to this number (required for sieve mode) |
 | `-c` | Count only — no state file, faster for large targets |
+| `-s` | Save state file — overrides `-c`; uses batched writes (minimal I/O penalty) |
 | `-r` | Report from existing `primes_state.bin` (no sieving) |
 | `-o file` | Write all discovered primes to a file (use `-` for stdout) |
 
@@ -99,7 +100,9 @@ Requires GCC or Clang on a 64-bit platform (for `__int128` support).
 |---|---|
 | `./fastsieve 100000000` | Sieve to 100M (target), save state file |
 | `./fastsieve -c 1000000000000` | Count primes ≤ 10¹², no disk writes |
-| `./fastsieve -c -o primes.txt 10^9` | Count + write all primes to file |
+| `./fastsieve -c -o primes.txt 1000000000` | Count + write all primes to file |
+| `./fastsieve -c -s 1000000000000` | Count + save state file (batched writes) |
+| `./fastsieve -c -s -o primes.txt 1000000000` | State file + text output in count mode |
 | `./fastsieve -r` | Print summary from existing state file |
 | `./fastsieve -r -o primes.txt` | Reconstruct prime list from state file |
 | `./fastsieve -c -r` | Error (mutually exclusive) |
@@ -119,8 +122,8 @@ Benchmarked on an Intel i7 (single thread):
 | 10¹¹ | ~4.1B | ~1.5 min | 698,255 |
 | 10¹² | ~37.6B | ~15 min | 6,982,555 |
 
-Timings with `-c` (count only).  Without `-c`, disk I/O for the
-state file roughly doubles the wall time at 10¹⁰+.
+State file writes use batched I/O (65K entries per flush), so
+the performance difference between default and `-c` is small.
 
 ## State File Format
 
