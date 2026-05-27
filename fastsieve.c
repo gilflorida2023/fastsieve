@@ -1,3 +1,27 @@
+/*
+ * fastsieve — Segmented Sieve of Eratosthenes with mod-210 Wheel
+ *
+ * Finds/counts primes in ranges up to ~10^38 using:
+ *   - mod-210 wheel factorization: pre-filters numbers divisible by
+ *     2,3,5,7, leaving only 48 of 210 candidates (77% reduction)
+ *   - Segmented processing: fixed-size windows keep the sieve buffer
+ *     L1-cache-friendly (~32 KB), requiring only primes up to sqrt(N)
+ *     in memory at once
+ *   - unsigned __int128: extends safe range beyond what uint64_t
+ *     allows (p*p overflow at p > 2^32)
+ *   - Dynamic base primes: bootstraps from {2,3,5,7} via squaring,
+ *     growing the base-prime list as sqrt(segment_end) increases
+ *
+ * Compile:  gcc -O3 -march=native -o fastsieve fastsieve.c
+ * Example:  ./fastsieve -c 1000000000000
+ *           ./fastsieve -r
+ *           ./fastsieve -c -o primes.txt 1000000000
+ *
+ * Reference: Pritchard (1981) "A Sublinear Additive Sieve for
+ * Finding Prime Numbers" — wheel factorization origin.
+ * Modern practice: Kim Walisch's primesieve, Tomás Oliveira e Silva.
+ */
+
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -5,6 +29,11 @@
 #include <stdbool.h>
 #include <time.h>
 
+/*
+ * unsigned __int128 is a GCC/Clang extension providing 128-bit integers.
+ * Max safe target: ~3.4e38 (p*p overflow at p > 2^64).
+ * Printing requires custom routines (no printf format specifier).
+ */
 typedef unsigned __int128 u128;
 
 #define FILENAME "primes_state.bin"
@@ -12,6 +41,13 @@ typedef unsigned __int128 u128;
 #define WHEEL_SIZE 48
 #define WHEEL_BYTES 48
 
+/*
+ * mod-210 wheel residues: numbers < 210 that are coprime to 210.
+ * 210 = 2 * 3 * 5 * 7, so these 48 residues are not divisible by
+ * 2, 3, 5, or 7 — the only possible prime values modulo 210.
+ * Every prime >= 11 falls into exactly one of these residues.
+ * This eliminates 77% of candidates before sieving begins.
+ */
 static const uint64_t wheel_residues[WHEEL_SIZE] = {
     1, 11, 13, 17, 19, 23, 29, 31, 37, 41, 43, 47,
     53, 59, 61, 67, 71, 73, 79, 83, 89, 97,
@@ -29,6 +65,15 @@ static void build_lut(void) {
         residue_to_bit[wheel_residues[i]] = i;
 }
 
+/*
+ * PrimeEntry: one entry in the binary state file (primes_state.bin).
+ *   prime: a discovered prime value
+ *   next:  first multiple of prime that falls in or after the
+ *          current segment (used for resumability)
+ *
+ * Layout on disk: 4 consecutive uint64_t values in little-endian:
+ *   [prime_lo, prime_hi, next_lo, next_hi]  (32 bytes total)
+ */
 typedef struct {
     u128 prime;
     u128 next;
@@ -126,6 +171,20 @@ static void add_base_prime(u128 p) {
     base_count++;
 }
 
+/*
+ * Grow the base-prime list so it covers all primes up to `limit`.
+ * Uses bootstrapping by squaring:
+ *   Level 0: hardcode {2,3,5,7}
+ *   Level 1: sieve [8, 49]     using level 0 (7^2 = 49)
+ *   Level 2: sieve [50, 2401]  using level 1 (49^2 = 2401)
+ *   ...
+ * This converges rapidly (5 levels exceed 128-bit range).
+ * Within each level, the same wheel-segmented approach is used:
+ *   - Clear a buffer of wheel candidates
+ *   - Mark composites using existing base primes
+ *   - Scan survivors: each is a new base prime
+ *   - Mark multiples of each new prime in remaining buffer
+ */
 static void extend_base_primes(u128 limit) {
     if (limit <= base_sieved) return;
     if (limit > (u128)1 << 62) limit = (u128)1 << 62;
@@ -208,6 +267,28 @@ static void extend_base_primes(u128 limit) {
     }
 }
 
+/*
+ * Process one segment [seg_start, seg_end] of the number line.
+ *
+ * Phase 1 — Mark composites:
+ *   For each base prime p, walk its wheel-aligned multiples in the
+ *   segment and clear their residue slots in the buffer. The starting
+ *   multiple is max(p*p, next_multiple_ge_seg_start) to avoid
+ *   redundant work (smaller multiples were handled by smaller primes
+ *   or in previous segments).
+ *
+ * Phase 2 — Discover primes:
+ *   Scan the buffer for surviving (non-cleared) residue slots.
+ *   Each survivor is a new prime. For each:
+ *     - Increment the total count
+ *     - Write to the state file (if not -c) and/or output file (if -o)
+ *     - Mark its multiples in the remaining buffer (starting from p*p)
+ *       so later survivors are not fooled by composites.
+ *
+ * The buffer uses 1 byte per wheel residue position, 48 bytes per
+ * 210-number block. The block layout allows O(1) indexing from any
+ * number via: block = number / 210, residue = number % 210.
+ */
 static void process_segment(FILE *state_fp, u128 seg_start, u128 seg_end,
                             FILE *output_fp) {
     if (seg_start > seg_end) return;
@@ -282,6 +363,17 @@ static void process_segment(FILE *state_fp, u128 seg_start, u128 seg_end,
     free(buf);
 }
 
+/*
+ * Auto-optimize buffer size: target a 32 KiB sieve buffer.
+ *
+ * The sieve buffer uses 48 bytes per 210-number block (one byte per
+ * wheel residue). To fill roughly 32 KiB (32768 bytes) of L1 cache:
+ *   blocks  = 32768 / 48  ≈ 682
+ *   numbers = 682 × 210  = 143,220
+ *
+ * This is clamped to [210, target] so single-segment runs work
+ * correctly for small targets.
+ */
 static u128 auto_opt_buffer(u128 target) {
     u128 buf = ((u128)32768 / WHEEL_BYTES) * WHEEL_MOD;
     if (buf < WHEEL_MOD) buf = WHEEL_MOD;
@@ -441,6 +533,9 @@ int main(int argc, char **argv) {
     u128 sqrt_cur = 2;
     uint64_t segs = 0;
 
+    /* Primes 2,3,5,7 define the wheel and are NOT in the wheel
+     * residues (they'd be excluded as wheel divisors). Count and
+     * write them explicitly before the segmented loop begins. */
     static const u128 small_primes[] = {2, 3, 5, 7};
     for (int i = 0; i < 4; i++) {
         if (small_primes[i] > target) continue;

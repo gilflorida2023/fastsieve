@@ -1,0 +1,148 @@
+# fastsieve — mod-210 Wheel Segmented Prime Sieve
+
+**fastsieve** counts and enumerates primes in large ranges using a
+segmented Sieve of Eratosthenes with mod-210 wheel factorization and
+128-bit integers.  It can sieve up to ~10³⁸, limited only by time.
+
+## Algorithm
+
+### Sieve of Eratosthenes (Segmented)
+
+The classic sieve marks multiples of each known prime as composite.
+Rather than allocating a bitmap for the entire range (impossible for
+large N), **segmentation** processes the number line in fixed-size
+windows.  Only primes up to √N need to be stored in memory — about
+50 million primes for N = 10¹⁸, which fits in ~400 MB.
+
+For each window:
+1. Initialize the sieve buffer (all candidates = prime)
+2. For each stored base prime, walk its multiples within the window
+   and mark them composite
+3. Scan the window for survivors — each survivor is a new prime
+4. Write discovered primes to the state file (optional)
+
+### mod-210 Wheel
+
+Numbers divisible by 2, 3, 5, or 7 can never be prime (except 2, 3,
+5, 7 themselves).  The wheel pre-excludes them: of every 210
+consecutive integers, only 48 residues are coprime to 210 and need
+to be checked.  This reduces the candidate set by **77%**.
+
+The 48 residues are:
+
+```
+1, 11, 13, 17, 19, 23, 29, 31, 37, 41, 43, 47,
+53, 59, 61, 67, 71, 73, 79, 83, 89, 97,
+101, 103, 107, 109, 113, 121, 127, 131,
+137, 139, 143, 149, 151, 157, 163, 167, 169, 173,
+179, 181, 187, 191, 193, 197, 199, 209
+```
+
+These are all numbers < 210 not divisible by 2, 3, 5, or 7.
+
+### Dynamic Base Primes
+
+Rather than pre-sieving all primes up to √N at startup, the base
+prime list grows via **bootstrapping by squaring**:
+
+1. Start with `{2, 3, 5, 7}`
+2. Sieve the range `[8, 49]` using these — now we have primes up to 49
+3. Sieve `[50, 2401]` using primes up to 49 — now we have primes up to 2401
+4. Sieve `[2402, 5,764,801]` — primes up to 5.7M
+5. Continue until we have primes up to √(current segment end)
+
+Each level squares the maximum known prime, so 5 levels suffice for
+any 128-bit target.
+
+### 128-bit Integers
+
+Standard C `uint64_t` overflows when computing `p * p` for
+p > 2³² (~4.3×10⁹), limiting the safe target to ~10¹⁹.  **fastsieve**
+uses `unsigned __int128` (GCC/Clang extension), which allows
+`p * p` up to p = 2⁶⁴−1 and targets up to ~3.4×10³⁸.
+
+### Origin of the Wheel Sieve
+
+- **Pritchard (1981)**: "A Sublinear Additive Sieve for Finding Prime
+  Numbers" — first formal description of wheel factorization.
+- **Tomás Oliveira e Silva (2001)**: Bucket sieve algorithm for
+  cache-efficient segmentation at extreme ranges.
+- **Kim Walisch (primesieve)**: State-of-the-art implementation using
+  a mod-210 wheel, SIMD, and bucket sieving; achieves 0.4 seconds
+  for π(10⁹) on a modern CPU.
+
+## Compilation
+
+```sh
+gcc -O3 -march=native -o fastsieve fastsieve.c
+```
+
+Requires GCC or Clang on a 64-bit platform (for `__int128` support).
+
+## Usage
+
+```sh
+./fastsieve [buffer_size] [target] [-c] [-r] [-o file]
+```
+
+| Argument | Description |
+|---|---|
+| `buffer_size` | Segment window in natural numbers (optional, auto-optimized to ~143K) |
+| `target` | Sieve up to this number (required for sieve mode) |
+| `-c` | Count only — no state file, faster for large targets |
+| `-r` | Report from existing `primes_state.bin` (no sieving) |
+| `-o file` | Write all discovered primes to a file (use `-` for stdout) |
+
+### Examples
+
+| Command | What it does |
+|---|---|
+| `./fastsieve 100000000` | Sieve to 100M (target), save state file |
+| `./fastsieve -c 1000000000000` | Count primes ≤ 10¹², no disk writes |
+| `./fastsieve -c -o primes.txt 10^9` | Count + write all primes to file |
+| `./fastsieve -r` | Print summary from existing state file |
+| `./fastsieve -r -o primes.txt` | Reconstruct prime list from state file |
+| `./fastsieve -c -r` | Error (mutually exclusive) |
+| `./fastsieve` | Print help |
+
+## Performance
+
+Benchmarked on an Intel i7 (single thread):
+
+| Target | π(target) | Time | Segments |
+|---|---|---|---|
+| 10⁶ | 78,498 | 0.01 sec | 7 |
+| 10⁷ | 664,579 | 0.02 sec | 70 |
+| 10⁸ | 5,761,455 | 0.13 sec | 698 |
+| 10⁹ | 50,847,534 | 1.0 sec | 6,983 |
+| 10¹⁰ | 455,052,511 | 9.5 sec | 69,823 |
+| 10¹¹ | ~4.1B | ~1.5 min | 698,255 |
+| 10¹² | ~37.6B | ~15 min | 6,982,555 |
+
+Timings with `-c` (count only).  Without `-c`, disk I/O for the
+state file roughly doubles the wall time at 10¹⁰+.
+
+## State File Format
+
+`primes_state.bin` stores discovered primes for resumability.
+Each entry is 32 bytes:
+
+```
+offset 0: prime_lo (uint64_t, little-endian)
+offset 8: prime_hi (uint64_t, little-endian)
+offset 16: next_lo (uint64_t, little-endian)
+offset 24: next_hi (uint64_t, little-endian)
+```
+
+Where `prime = (hi << 64) | lo` and `next` is the first multiple of
+`prime` that falls in or after the current segment.
+
+## Files
+
+```
+fastsieve.c          — source code
+README.md            — this file
+.gitignore           — ignores binaries, state file, output/
+primes_state.bin     — state file (generated, git-ignored)
+output/              — optional output directory for -o files
+```
