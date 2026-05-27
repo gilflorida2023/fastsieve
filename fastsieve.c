@@ -86,6 +86,13 @@ static u128 base_sieved = 0;
 
 static uint64_t total_count = 0;
 
+/* Batched state file writes: accumulate PrimeEntry structs in memory
+ * and flush to disk once per segment (every ~65K primes), reducing
+ * syscall overhead vs one fwrite per prime. */
+#define FLUSH_BATCH 65536
+static PrimeEntry *write_buf = NULL;
+static uint64_t write_buf_count = 0;
+
 static void print_u128(u128 n) {
     if (n == 0) { putchar('0'); return; }
     char buf[48];
@@ -137,17 +144,33 @@ static int parse_u128(const char *s, u128 *out) {
     return 1;
 }
 
-static int write_entry(FILE *fp, PrimeEntry *e) {
-    uint64_t lo, hi;
-    lo = (uint64_t)e->prime;
-    hi = (uint64_t)(e->prime >> 64);
-    if (fwrite(&lo, 8, 1, fp) != 1) return 0;
-    if (fwrite(&hi, 8, 1, fp) != 1) return 0;
-    lo = (uint64_t)e->next;
-    hi = (uint64_t)(e->next >> 64);
-    if (fwrite(&lo, 8, 1, fp) != 1) return 0;
-    if (fwrite(&hi, 8, 1, fp) != 1) return 0;
-    return 1;
+/* Flush buffered entries to disk (portable serialization: each u128
+ * as two uint64_t halves in little-endian). Must be called before
+ * fclose and before any fseek/read on the state file. */
+static void flush_entries(FILE *state_fp) {
+    if (!state_fp || write_buf_count == 0) return;
+    for (uint64_t i = 0; i < write_buf_count; i++) {
+        PrimeEntry *e = &write_buf[i];
+        uint64_t lo, hi;
+        lo = (uint64_t)e->prime;
+        hi = (uint64_t)(e->prime >> 64);
+        fwrite(&lo, 8, 1, state_fp);
+        fwrite(&hi, 8, 1, state_fp);
+        lo = (uint64_t)e->next;
+        hi = (uint64_t)(e->next >> 64);
+        fwrite(&lo, 8, 1, state_fp);
+        fwrite(&hi, 8, 1, state_fp);
+    }
+    write_buf_count = 0;
+}
+
+/* Buffer a PrimeEntry for batched writing. Flushes to disk when the
+ * buffer fills. state_fp may be NULL (no-op if no state file). */
+static void buffer_entry(FILE *state_fp, PrimeEntry *e) {
+    if (!state_fp) return;
+    write_buf[write_buf_count++] = *e;
+    if (write_buf_count >= FLUSH_BATCH)
+        flush_entries(state_fp);
 }
 
 static int read_entry(FILE *fp, PrimeEntry *e) {
@@ -335,10 +358,7 @@ static void process_segment(FILE *state_fp, u128 seg_start, u128 seg_end,
             while (e.next <= seg_end)
                 e.next += n;
 
-            if (state_fp) {
-                fseek(state_fp, 0, SEEK_END);
-                write_entry(state_fp, &e);
-            }
+            buffer_entry(state_fp, &e);
 
             if (output_fp) {
                 print_u128_f(output_fp, n);
@@ -402,10 +422,11 @@ static void format_duration(double sec, char *buf, size_t sz) {
 }
 
 static void print_help(void) {
-    printf("Usage: primes [buffer_size] [target] [-c] [-r] [-o file]\n");
+    printf("Usage: primes [buffer_size] [target] [-c] [-s] [-r] [-o file]\n");
     printf("  buffer_size  segment window size in natural numbers (optional, auto-opt)\n");
     printf("  target       sieve up to this number (required for sieve; omit for -r)\n");
     printf("  -c           count only (no state file, faster)\n");
+    printf("  -s           save state file (overrides -c, batched writes)\n");
     printf("  -r           report from existing primes_state.bin (no sieve)\n");
     printf("  -o file      write primes to file (use \"-\" for stdout)\n");
 }
@@ -418,11 +439,14 @@ int main(int argc, char **argv) {
     char *output_filename = NULL;
     int count_only = 0;
     int report_mode = 0;
+    int save_state = 0;
 
     int num_count = 0;
     for (int i = 1; i < argc; i++) {
         if (strcmp(argv[i], "-c") == 0) {
             count_only = 1;
+        } else if (strcmp(argv[i], "-s") == 0) {
+            save_state = 1;
         } else if (strcmp(argv[i], "-r") == 0) {
             report_mode = 1;
         } else if (strcmp(argv[i], "-o") == 0) {
@@ -446,8 +470,8 @@ int main(int argc, char **argv) {
     }
     if (num_count == 1) { target = buffer_size; buffer_size = 0; }
 
-    if (count_only && report_mode) {
-        fprintf(stderr, "Cannot use -c and -r together\n");
+    if (report_mode && (count_only || save_state)) {
+        fprintf(stderr, "-r cannot be combined with -c or -s\n");
         return 1;
     }
 
@@ -509,12 +533,14 @@ int main(int argc, char **argv) {
     printf("\n");
 
     FILE *state_fp = NULL;
-    if (!count_only) {
+    if (!count_only || save_state) {
         state_fp = fopen(FILENAME, "wb+");
         if (!state_fp) {
             perror("Failed to open state file");
             return 1;
         }
+        write_buf = malloc(FLUSH_BATCH * sizeof(PrimeEntry));
+        if (!write_buf) { fprintf(stderr, "Out of memory\n"); return 1; }
     }
 
     FILE *output_fp = NULL;
@@ -542,7 +568,7 @@ int main(int argc, char **argv) {
         total_count++;
         if (state_fp) {
             PrimeEntry e = {small_primes[i], small_primes[i] * 2};
-            write_entry(state_fp, &e);
+            buffer_entry(state_fp, &e);
         }
         if (output_fp) {
             print_u128_f(output_fp, small_primes[i]);
@@ -574,7 +600,11 @@ int main(int argc, char **argv) {
     printf(" primes in %llu segments (%s)\n",
            (unsigned long long)segs, dur);
 
-    if (state_fp) fclose(state_fp);
+    if (state_fp) {
+        flush_entries(state_fp);
+        fclose(state_fp);
+    }
+    free(write_buf);
     if (output_fp) fclose(output_fp);
 
     free(base);
