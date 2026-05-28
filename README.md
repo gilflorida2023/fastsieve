@@ -82,16 +82,17 @@ Requires GCC or Clang on a 64-bit platform (for `__int128` support).
 ## Usage
 
 ```sh
-./fastsieve [buffer_size] [target] [-c] [-s] [-r] [-o file]
+./fastsieve [buffer_size] [target] [-c] [-s] [-r] [-R] [-o file]
 ```
 
 | Argument | Description |
-|---|---|
+|---|---|---|
 | `buffer_size` | Segment window in natural numbers (optional, auto-optimized to ~143K) |
-| `target` | Sieve up to this number (required for sieve mode) |
+| `target` | Sieve up to this number (required for sieve, report, and resume) |
 | `-c` | Count only — no state file, faster for large targets |
 | `-s` | Save state file — overrides `-c`; uses batched writes (minimal I/O penalty) |
 | `-r` | Report from existing `primes_state.bin` (no sieving) |
+| `-R` | Resume from checkpoint — load `primes_state.ckpt`, continue sieving from the last committed position (requires target > last sieved). State file is appended to automatically (unless `-c`). |
 | `-o file` | Write all discovered primes to a file (use `-` for stdout) |
 
 ### Examples
@@ -105,7 +106,13 @@ Requires GCC or Clang on a 64-bit platform (for `__int128` support).
 | `./fastsieve -c -s -o primes.txt 1000000000` | State file + text output in count mode |
 | `./fastsieve -r` | Print summary from existing state file |
 | `./fastsieve -r -o primes.txt` | Reconstruct prime list from state file |
+| `./fastsieve -s 10000000` | Sieve to 10M, create state + checkpoint files |
+| `./fastsieve -R 20000000` | Resume from 10M → 20M, append to state file |
+| `./fastsieve -R -c 50000000` | Resume, count only — no state writes, fastest |
+| `./fastsieve -R 5000000` | Target ≤ last sieved → no-op, prints existing count |
+| `./fastsieve -R 50000000` *(after crash)* | Resume from last committed checkpoint; re-processes ≤10 segments |
 | `./fastsieve -c -r` | Error (mutually exclusive) |
+| `./fastsieve -R -r` | Error (mutually exclusive) |
 | `./fastsieve` | Print help |
 
 ## Performance
@@ -125,6 +132,49 @@ Benchmarked on an Intel i7 (single thread):
 State file writes use batched I/O (65K entries per flush), so
 the performance difference between default and `-c` is small.
 
+## Resume & Crash Recovery
+
+When running with state saving (`-s` or default mode), fastsieve maintains
+a **checkpoint file** (`primes_state.ckpt`) that records the last committed
+position.  This enables resuming after an interruption.
+
+### How it works
+
+1. **`primes_state.bin`** — append-only entry list.  Never overwritten, always
+   consistent.  Entries are flushed in batches (65K per write) for performance.
+2. **`primes_state.ckpt`** — 48-byte checkpoint with `last_sieved`, `total_count`,
+   `entry_count`, `original_target`, and a magic number.  Updated atomically
+   after every 10 segments and at final completion.
+
+### Atomic update
+
+The checkpoint is written to a temporary file first, then moved into place with
+POSIX `rename()`, which is atomic on the same filesystem.  If the process is
+killed during the write, the previous checkpoint survives — no corruption.
+
+### What you lose on a crash
+
+At most **10 segments** (≈1.4M numbers with the default buffer).  The next
+resume starts from the last committed checkpoint and re-processes those
+segments.  The state file may contain garbage bytes beyond `entry_count`;
+these are overwritten on resume.
+
+### Completing a partial run
+
+```sh
+# Example: start a long sieve
+./fastsieve -s 1000000000000
+
+# … machine crashes or Ctrl+C …
+# Later, resume from wherever it left off:
+./fastsieve -R 1000000000000
+```
+
+The `original_target` in the checkpoint tells you what the first run aimed
+for.  If you accidentally specify a smaller target, fastsieve prints a warning
+but continues.  If the new target is ≤ the last sieved position, it's a no-op
+(the count is printed).
+
 ## State File Format
 
 `primes_state.bin` stores discovered primes for resumability.
@@ -140,6 +190,31 @@ offset 24: next_hi (uint64_t, little-endian)
 Where `prime = (hi << 64) | lo` and `next` is the first multiple of
 `prime` that falls in or after the current segment.
 
+### Checkpoint File
+
+`primes_state.ckpt` (48 bytes) stores the last committed resume position.
+Updated atomically every 10 segments.
+
+```
+offset  0: last_sieved_lo (uint64_t, little-endian)
+offset  8: last_sieved_hi (uint64_t, little-endian)
+offset 16: total_count (uint64_t)
+offset 24: entry_count (uint64_t)
+offset 32: original_target_lo (uint64_t, little-endian)
+offset 40: original_target_hi (uint64_t, little-endian)
+offset 48: magic (uint64_t = 0x4553554D45525F4D)
+```
+
+- `last_sieved` — last number fully processed; resume continues from here + 1.
+- `total_count` — cumulative prime count at checkpoint time.
+- `entry_count` — number of valid entries in `primes_state.bin`.  On resume,
+  the program seeks to `entry_count × 32` before appending, overwriting any
+  garbage bytes left by a crashed write.
+- `original_target` — target from the initial run.  If a resume target is
+  smaller, a warning is printed.
+- `magic` — distinguishes a valid checkpoint from arbitrary data
+  (`0x4553554D45525F4D` ≙ `"M_RESUME"`).
+
 ## Files
 
 ```
@@ -147,5 +222,6 @@ fastsieve.c          — source code
 README.md            — this file
 .gitignore           — ignores binaries, state file, output/
 primes_state.bin     — state file (generated, git-ignored)
+primes_state.ckpt    — resume checkpoint (generated, git-ignored)
 output/              — optional output directory for -o files
 ```

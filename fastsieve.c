@@ -93,6 +93,26 @@ static uint64_t total_count = 0;
 static PrimeEntry *write_buf = NULL;
 static uint64_t write_buf_count = 0;
 
+/* Track how many entries have been flushed to the state file.
+ * Used by the resume checkpoint to know where valid entries end
+ * (entries beyond this count may be garbage from a crashed write). */
+static uint64_t state_entry_count = 0;
+
+/* -- Resume checkpoint support --------------------------------------------
+ * A separate small file (primes_state.ckpt) stores the last committed
+ * resume position.  It is atomically updated via write-to-temp + rename,
+ * so a crash never corrupts the checkpoint (the previous copy survives).
+ *
+ * Layout on disk (48 bytes total):
+ *   [last_sieved_lo (8)] [last_sieved_hi (8)]   -- u128
+ *   [total_count (8)]                            -- uint64_t
+ *   [entry_count (8)]                            -- uint64_t
+ *   [original_target_lo (8)] [original_target_hi (8)]  -- u128
+ *   [magic (8)]                                  -- uint64_t
+ */
+#define CHECKPOINT_FILE "primes_state.ckpt"
+#define CHECKPOINT_MAGIC ((uint64_t)0x4553554D45525F4D) /* "M_RESUME" */
+
 static void print_u128(u128 n) {
     if (n == 0) { putchar('0'); return; }
     char buf[48];
@@ -161,6 +181,7 @@ static void flush_entries(FILE *state_fp) {
         fwrite(&lo, 8, 1, state_fp);
         fwrite(&hi, 8, 1, state_fp);
     }
+    state_entry_count += write_buf_count;
     write_buf_count = 0;
 }
 
@@ -171,6 +192,63 @@ static void buffer_entry(FILE *state_fp, PrimeEntry *e) {
     write_buf[write_buf_count++] = *e;
     if (write_buf_count >= FLUSH_BATCH)
         flush_entries(state_fp);
+}
+
+static void checkpoint_write(u128 last_sieved, u128 original_target,
+                             uint64_t total_count, uint64_t entry_count) {
+    FILE *fp = fopen(CHECKPOINT_FILE ".tmp", "wb");
+    if (!fp) return;
+
+    /* serialize last_sieved (u128 as two uint64_t halves) */
+    uint64_t lo = (uint64_t)last_sieved;
+    uint64_t hi = (uint64_t)(last_sieved >> 64);
+    fwrite(&lo, 8, 1, fp);
+    fwrite(&hi, 8, 1, fp);
+
+    /* total_count, entry_count */
+    fwrite(&total_count, 8, 1, fp);
+    fwrite(&entry_count, 8, 1, fp);
+
+    /* original_target (u128) */
+    lo = (uint64_t)original_target;
+    hi = (uint64_t)(original_target >> 64);
+    fwrite(&lo, 8, 1, fp);
+    fwrite(&hi, 8, 1, fp);
+
+    /* magic — marks a complete, valid footer */
+    uint64_t magic = CHECKPOINT_MAGIC;
+    fwrite(&magic, 8, 1, fp);
+
+    fclose(fp);
+
+    /* Atomic replacement: the rename(2) is POSIX-atomic on the same
+     * filesystem.  If interrupted here, the original .ckpt still exists
+     * and remains valid. */
+    rename(CHECKPOINT_FILE ".tmp", CHECKPOINT_FILE);
+}
+
+static int checkpoint_read(u128 *last_sieved, u128 *original_target,
+                           uint64_t *total_count, uint64_t *entry_count) {
+    FILE *fp = fopen(CHECKPOINT_FILE, "rb");
+    if (!fp) return 0;
+
+    uint64_t lo, hi, magic;
+    if (fread(&lo, 8, 1, fp) != 1) { fclose(fp); return 0; }
+    if (fread(&hi, 8, 1, fp) != 1) { fclose(fp); return 0; }
+    *last_sieved = ((u128)hi << 64) | lo;
+
+    if (fread(total_count, 8, 1, fp) != 1) { fclose(fp); return 0; }
+    if (fread(entry_count, 8, 1, fp) != 1) { fclose(fp); return 0; }
+
+    if (fread(&lo, 8, 1, fp) != 1) { fclose(fp); return 0; }
+    if (fread(&hi, 8, 1, fp) != 1) { fclose(fp); return 0; }
+    *original_target = ((u128)hi << 64) | lo;
+
+    if (fread(&magic, 8, 1, fp) != 1) { fclose(fp); return 0; }
+    if (magic != CHECKPOINT_MAGIC)    { fclose(fp); return 0; }
+
+    fclose(fp);
+    return 1;
 }
 
 static int read_entry(FILE *fp, PrimeEntry *e) {
@@ -422,12 +500,13 @@ static void format_duration(double sec, char *buf, size_t sz) {
 }
 
 static void print_help(void) {
-    printf("Usage: primes [buffer_size] [target] [-c] [-s] [-r] [-o file]\n");
+    printf("Usage: fastsieve [buffer_size] [target] [-c] [-s] [-r] [-R] [-o file]\n");
     printf("  buffer_size  segment window size in natural numbers (optional, auto-opt)\n");
-    printf("  target       sieve up to this number (required for sieve; omit for -r)\n");
+    printf("  target       sieve up to this number (required for sieve, report, or resume)\n");
     printf("  -c           count only (no state file, faster)\n");
     printf("  -s           save state file (overrides -c, batched writes)\n");
     printf("  -r           report from existing primes_state.bin (no sieve)\n");
+    printf("  -R           resume from checkpoint (requires target > last sieved)\n");
     printf("  -o file      write primes to file (use \"-\" for stdout)\n");
 }
 
@@ -440,6 +519,7 @@ int main(int argc, char **argv) {
     int count_only = 0;
     int report_mode = 0;
     int save_state = 0;
+    int resume_mode = 0;
 
     int num_count = 0;
     for (int i = 1; i < argc; i++) {
@@ -449,6 +529,8 @@ int main(int argc, char **argv) {
             save_state = 1;
         } else if (strcmp(argv[i], "-r") == 0) {
             report_mode = 1;
+        } else if (strcmp(argv[i], "-R") == 0) {
+            resume_mode = 1;
         } else if (strcmp(argv[i], "-o") == 0) {
             if (i + 1 < argc) output_filename = argv[++i];
             else { fprintf(stderr, "-o requires a filename\n"); return 1; }
@@ -470,8 +552,8 @@ int main(int argc, char **argv) {
     }
     if (num_count == 1) { target = buffer_size; buffer_size = 0; }
 
-    if (report_mode && (count_only || save_state)) {
-        fprintf(stderr, "-r cannot be combined with -c or -s\n");
+    if (report_mode && (count_only || save_state || resume_mode)) {
+        fprintf(stderr, "-r cannot be combined with -c, -s, or -R\n");
         return 1;
     }
 
@@ -518,6 +600,48 @@ int main(int argc, char **argv) {
         return 0;
     }
 
+    u128 original_target = 0;
+    u128 res_last = 0;  /* set in resume-mode block, read later */
+
+    /* ----- Resume mode -------------------------------------------------- */
+    if (resume_mode) {
+        u128 res_orig;
+        uint64_t res_total, res_entries;
+
+        if (!checkpoint_read(&res_last, &res_orig, &res_total, &res_entries)) {
+            fprintf(stderr, "No valid checkpoint found in %s.\n"
+                            "Run without -R for a fresh sieve, or use -r"
+                            " to report.\n", CHECKPOINT_FILE);
+            return 1;
+        }
+
+        if (target <= res_last) {
+            printf("Target already fully sieved (last sieved: ");
+            print_u128(res_last);
+            printf(").\n");
+            print_u128(res_total);
+            printf(" primes found.\n");
+            return 0;
+        }
+
+        if (target < res_orig) {
+            printf("Note: new target is smaller than the original target (");
+            print_u128(res_orig);
+            printf("). Continuing.\n");
+        }
+
+        total_count = res_total;
+        state_entry_count = res_entries;
+        original_target = res_orig;
+        base_count = 0;
+        base_sieved = 0;
+
+        if (buffer_size == 0)
+            buffer_size = auto_opt_buffer(target);
+    } else {
+        original_target = target;
+    }
+
     if (target == 0) {
         print_help();
         return 1;
@@ -534,13 +658,26 @@ int main(int argc, char **argv) {
 
     FILE *state_fp = NULL;
     if (!count_only || save_state) {
-        state_fp = fopen(FILENAME, "wb+");
-        if (!state_fp) {
-            perror("Failed to open state file");
-            return 1;
+        if (resume_mode) {
+            state_fp = fopen(FILENAME, "rb+");
+            if (!state_fp) {
+                perror("Failed to open " FILENAME " for resume");
+                return 1;
+            }
+            fseek(state_fp, state_entry_count * 32, SEEK_SET);
+        } else {
+            state_fp = fopen(FILENAME, "wb+");
+            if (!state_fp) {
+                perror("Failed to open state file");
+                return 1;
+            }
         }
         write_buf = malloc(FLUSH_BATCH * sizeof(PrimeEntry));
-        if (!write_buf) { fprintf(stderr, "Out of memory\n"); return 1; }
+        if (!write_buf) {
+            fprintf(stderr, "Out of memory\n");
+            if (state_fp) fclose(state_fp);
+            return 1;
+        }
     }
 
     FILE *output_fp = NULL;
@@ -548,7 +685,7 @@ int main(int argc, char **argv) {
         output_fp = fopen(output_filename, "w");
         if (!output_fp) {
             perror("Failed to open output file");
-            fclose(state_fp);
+            if (state_fp) fclose(state_fp);
             return 1;
         }
     }
@@ -559,20 +696,38 @@ int main(int argc, char **argv) {
     u128 sqrt_cur = 2;
     uint64_t segs = 0;
 
+    if (resume_mode) {
+        current = res_last + 1;
+        printf("Resuming from ");
+        print_u128(current);
+        printf(" to ");
+        print_u128(target);
+        printf("\n");
+    }
+
     /* Primes 2,3,5,7 define the wheel and are NOT in the wheel
      * residues (they'd be excluded as wheel divisors). Count and
-     * write them explicitly before the segmented loop begins. */
-    static const u128 small_primes[] = {2, 3, 5, 7};
-    for (int i = 0; i < 4; i++) {
-        if (small_primes[i] > target) continue;
-        total_count++;
-        if (state_fp) {
-            PrimeEntry e = {small_primes[i], small_primes[i] * 2};
-            buffer_entry(state_fp, &e);
+     * write them explicitly before the segmented loop begins.
+     * Skipped in resume mode — they are already in the state file. */
+    if (!resume_mode) {
+        static const u128 small_primes[] = {2, 3, 5, 7};
+        for (int i = 0; i < 4; i++) {
+            if (small_primes[i] > target) continue;
+            total_count++;
+            if (state_fp) {
+                PrimeEntry e = {small_primes[i], small_primes[i] * 2};
+                buffer_entry(state_fp, &e);
+            }
+            if (output_fp) {
+                print_u128_f(output_fp, small_primes[i]);
+                fputc('\n', output_fp);
+            }
         }
-        if (output_fp) {
-            print_u128_f(output_fp, small_primes[i]);
-            fputc('\n', output_fp);
+        /* Initial checkpoint right after small primes */
+        if (state_fp) {
+            flush_entries(state_fp);
+            checkpoint_write(7, original_target, total_count,
+                             state_entry_count);
         }
     }
 
@@ -585,6 +740,14 @@ int main(int argc, char **argv) {
             extend_base_primes(sqrt_cur);
 
         process_segment(state_fp, current, seg_end, output_fp);
+
+        /* Periodic checkpoint (every 10 segments) so a crash loses
+         * at most 10 segments of progress. */
+        if (state_fp && (segs % 10 == 0)) {
+            flush_entries(state_fp);
+            checkpoint_write(seg_end, original_target, total_count,
+                             state_entry_count);
+        }
 
         current = seg_end + 1;
         segs++;
@@ -602,6 +765,8 @@ int main(int argc, char **argv) {
 
     if (state_fp) {
         flush_entries(state_fp);
+        checkpoint_write(target, original_target, total_count,
+                         state_entry_count);
         fclose(state_fp);
     }
     free(write_buf);
