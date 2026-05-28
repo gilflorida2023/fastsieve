@@ -117,20 +117,25 @@ Requires GCC or Clang on a 64-bit platform (for `__int128` support).
 
 ## Performance
 
-Benchmarked on an Intel i7 (single thread):
+Benchmarked on an **AMD Ryzen 5 PRO 8500GE** (Zen 4c, 6 cores/12 threads,
+single-threaded run, GCC 14.2.0 `-O3 -march=native`):
 
 | Target | π(target) | Time | Segments |
 |---|---|---|---|
-| 10⁶ | 78,498 | 0.01 sec | 7 |
-| 10⁷ | 664,579 | 0.02 sec | 70 |
-| 10⁸ | 5,761,455 | 0.13 sec | 698 |
-| 10⁹ | 50,847,534 | 1.0 sec | 6,983 |
-| 10¹⁰ | 455,052,511 | 9.5 sec | 69,823 |
-| 10¹¹ | ~4.1B | ~1.5 min | 698,255 |
-| 10¹² | ~37.6B | ~15 min | 6,982,555 |
+| 10⁶ | 78,498 | 0.004 sec | 7 |
+| 10⁷ | 664,579 | 0.03 sec | 70 |
+| 10⁸ | 5,761,455 | 0.35 sec | 699 |
+| 10⁹ | 50,847,534 | 3.9 sec | 6,983 |
+| 10¹⁰ | 455,052,511 | 48 sec | 69,823 |
+| 10¹¹ | ~4.1B | ~8 min* | 698,255 |
+| 10¹² | ~37.6B | ~1.4 hr* | 6,982,555 |
 
-State file writes use batched I/O (65K entries per flush), so
-the performance difference between default and `-c` is small.
+\* Estimated from 10¹⁰ scaling (algorithm is O(N log log N)).
+
+The inner marking loop uses incremental residue/block tracking instead of
+128-bit modulo and division, giving a **~2.3× speedup** over a naive
+implementation.  State file writes use batched I/O (65K entries per flush),
+so the performance difference between default and `-c` is small.
 
 ## Resume & Crash Recovery
 

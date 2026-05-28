@@ -330,14 +330,20 @@ static void extend_base_primes(u128 limit) {
             if (fm % p != 0)
                 fm += p - fm % p;
             u128 m = fm;
+            uint64_t step = (uint64_t)(p % WHEEL_MOD);
+            u128 blk_step = p / WHEEL_MOD;
+            uint64_t r = (uint64_t)(m % WHEEL_MOD);
+            u128 block = m / WHEEL_MOD;
             while (m <= end) {
-                uint64_t r = (uint64_t)(m % WHEEL_MOD);
                 uint8_t ri = residue_to_bit[r];
                 if (ri < WHEEL_SIZE) {
-                    uint64_t block = (uint64_t)(m / WHEEL_MOD) - first_block;
-                    buf[block * WHEEL_BYTES + ri] = 0;
+                    uint64_t buf_i = (uint64_t)(block - first_block);
+                    buf[buf_i * WHEEL_BYTES + ri] = 0;
                 }
                 m += p;
+                block += blk_step;
+                r += step;
+                if (r >= WHEEL_MOD) { r -= WHEEL_MOD; block++; }
             }
         }
 
@@ -351,14 +357,22 @@ static void extend_base_primes(u128 limit) {
 
                 u128 start_m = n * n;
                 if (start_m < start) start_m = start;
-                for (u128 m = start_m; m <= end; m += n) {
-                    uint64_t r = (uint64_t)(m % WHEEL_MOD);
+                u128 m = start_m;
+                uint64_t step = (uint64_t)(n % WHEEL_MOD);
+                u128 blk_step = n / WHEEL_MOD;
+                uint64_t r = (uint64_t)(m % WHEEL_MOD);
+                u128 block = m / WHEEL_MOD;
+                while (m <= end) {
                     uint8_t ri2 = residue_to_bit[r];
                     if (ri2 < WHEEL_SIZE) {
-                        uint64_t b = (uint64_t)(m / WHEEL_MOD) - first_block;
+                        uint64_t b = (uint64_t)(block - first_block);
                         if (b < num_blocks)
                             buf[b * WHEEL_BYTES + ri2] = 0;
                     }
+                    m += n;
+                    block += blk_step;
+                    r += step;
+                    if (r >= WHEEL_MOD) { r -= WHEEL_MOD; block++; }
                 }
             }
         }
@@ -411,14 +425,20 @@ static void process_segment(FILE *state_fp, u128 seg_start, u128 seg_end,
             fm += p - fm % p;
 
         u128 m = fm;
+        uint64_t step = (uint64_t)(p % WHEEL_MOD);
+        u128 blk_step = p / WHEEL_MOD;
+        uint64_t r = (uint64_t)(m % WHEEL_MOD);
+        u128 block = m / WHEEL_MOD;
         while (m <= seg_end) {
-            uint64_t r = (uint64_t)(m % WHEEL_MOD);
             uint8_t ri = residue_to_bit[r];
             if (ri < WHEEL_SIZE) {
-                uint64_t block = (uint64_t)(m / WHEEL_MOD) - first_block;
-                buf[block * WHEEL_BYTES + ri] = 0;
+                uint64_t b = (uint64_t)(block - first_block);
+                buf[b * WHEEL_BYTES + ri] = 0;
             }
             m += p;
+            block += blk_step;
+            r += step;
+            if (r >= WHEEL_MOD) { r -= WHEEL_MOD; block++; }
         }
     }
 
@@ -446,14 +466,22 @@ static void process_segment(FILE *state_fp, u128 seg_start, u128 seg_end,
             u128 start_m = n * n;
             if (start_m < seg_start) start_m = seg_start;
             if (start_m > seg_end) continue;
-            for (u128 m = start_m; m <= seg_end; m += n) {
-                uint64_t r = (uint64_t)(m % WHEEL_MOD);
+            u128 m = start_m;
+            uint64_t step = (uint64_t)(n % WHEEL_MOD);
+            u128 blk_step = n / WHEEL_MOD;
+            uint64_t r = (uint64_t)(m % WHEEL_MOD);
+            u128 block = m / WHEEL_MOD;
+            while (m <= seg_end) {
                 uint8_t ri2 = residue_to_bit[r];
                 if (ri2 < WHEEL_SIZE) {
-                    uint64_t b = (uint64_t)(m / WHEEL_MOD) - first_block;
+                    uint64_t b = (uint64_t)(block - first_block);
                     if (b < num_blocks)
                         buf[b * WHEEL_BYTES + ri2] = 0;
                 }
+                m += n;
+                block += blk_step;
+                r += step;
+                if (r >= WHEEL_MOD) { r -= WHEEL_MOD; block++; }
             }
         }
     }
