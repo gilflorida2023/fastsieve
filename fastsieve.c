@@ -650,7 +650,7 @@ static void process_segment(FILE *state_fp, u128 seg_start, u128 seg_end,
  * correctly for small targets.
  */
 static u128 auto_opt_buffer(u128 target) {
-    u128 buf = ((u128)32768 / WHEEL_BYTES) * WHEEL_MOD;
+    u128 buf = ((u128)262144 / WHEEL_BYTES) * WHEEL_MOD;
     if (buf < WHEEL_MOD) buf = WHEEL_MOD;
     if (buf > target) buf = target;
     return buf;
