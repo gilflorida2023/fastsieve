@@ -1,5 +1,6 @@
 *
 !fastsieve.c
 !Makefile
+!bench.sh
 !README.md
 !.gitignore
