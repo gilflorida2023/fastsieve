@@ -59,46 +59,27 @@ for t in 1000000 10000000 100000000 1000000000 10000000000; do
 done
 echo "" | tee -a "$RESULTS"
 
-# ── 4. Bucket/long runs with checkpoint resume ─────────────────────────────
-echo "── Long runs (with checkpoint resume) ──" | tee -a "$RESULTS"
+# ── 4. Long runs ────────────────────────────────────────────────────────
+echo "── Long runs (no state file: -c only) ──" | tee -a "$RESULTS"
 
 do_run() {
     local target="$1" label="$2"
-
-    # Try resume (-R exits 0 if complete or successful)
+    echo "  $label ..." | tee -a "$RESULTS"
     set +e
-    output=$($BIN -c -R "$target" 2>&1)
-    rc=$?
-    set -e
-
-    if [[ $rc -eq 0 ]]; then
-        if echo "$output" | grep -q "already fully sieved"; then
-            echo "  $label already complete" | tee -a "$RESULTS"
-            return
-        fi
-        dur=$(echo "$output" | sed -n 's/.*Found.*(\(.*\))/\1/p')
-        echo "  $label resumed => $dur" | tee -a "$RESULTS"
-        echo "$label target=$target result=resume,dur=$dur" >> "$RESULTS"
-        return
-    fi
-
-    # Fresh run with checkpoint
-    echo "  $label fresh run (may be long)" | tee -a "$RESULTS"
-    set +e
-    output=$($BIN -c -s "$target" 2>&1)
+    output=$($BIN -c "$target" 2>&1)
     rc=$?
     set -e
     if [[ $rc -eq 0 ]]; then
         dur=$(echo "$output" | sed -n 's/.*Found.*(\(.*\))/\1/p')
         echo "  $label done => $dur" | tee -a "$RESULTS"
-        echo "$label target=$target result=fresh,dur=$dur" >> "$RESULTS"
+        echo "$label target=$target dur=$dur" >> "$RESULTS"
     else
         echo "  $label FAILED (exit $rc)" | tee -a "$RESULTS"
         echo "$label target=$target result=fail,exit=$rc" >> "$RESULTS"
     fi
 }
 
-do_run "100000000000"  "10^11"
+do_run "100000000000" "10^11"
 do_run "1000000000000" "10^12"
 echo "" | tee -a "$RESULTS"
 
