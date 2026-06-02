@@ -28,6 +28,7 @@
 #include <stdint.h>
 #include <stdbool.h>
 #include <time.h>
+#include <unistd.h>
 
 /*
  * unsigned __int128 is a GCC/Clang extension providing 128-bit integers.
@@ -58,6 +59,51 @@ static const uint64_t wheel_residues[WHEEL_SIZE] = {
 
 static uint8_t residue_to_bit[WHEEL_MOD];
 
+/*
+ * Bucket sieve: instead of iterating over ALL π(√N) base primes per
+ * segment, each prime is placed into one of `nbuckets` circular buckets
+ * keyed by which segment its next multiple falls in.  When processing
+ * segment S only primes in bucket[S & bucket_mask] are visited — the
+ * rest are skipped until their next multiple actually lands in a
+ * segment.  For N=10¹² this reduces ~78K outer iterations/segment to
+ * ~49, a >1600× reduction.
+ *
+ * Tomás Oliveira e Silva (2001), also used by Kim Walisch's primesieve.
+ */
+typedef struct BucketNode {
+    u128 prime;
+    u128 next_multiple;
+    struct BucketNode *next;
+} BucketNode;
+
+static BucketNode **buckets = NULL;
+static BucketNode *node_pool = NULL;
+static uint64_t node_pool_used = 0;
+static uint64_t nbuckets = 0;
+static uint64_t bucket_mask = 0;
+
+/* Arena allocator: single contiguous region, bump-pointer. No free. */
+typedef struct {
+    char *base;
+    char *ptr;
+    char *end;
+} Arena;
+static Arena aren = {0};
+
+static void *arena_alloc(Arena *a, size_t sz) {
+    /* align to 16 bytes */
+    sz = (sz + 15) & ~(size_t)15;
+    if (a->ptr + sz > a->end) return NULL;
+    void *p = a->ptr;
+    a->ptr += sz;
+    return p;
+}
+static void arena_reset(void) { if (aren.base) aren.ptr = aren.base; }
+
+static u128 bucket_offset = 0;      /* first number of first segment */
+static u128 bucket_bufsize = 0;     /* copy of buffer_size */
+static u128 bucket_target = 0;      /* overall target (for drop check) */
+
 static void build_lut(void) {
     for (int i = 0; i < WHEEL_MOD; i++)
         residue_to_bit[i] = 0xFF;
@@ -65,8 +111,39 @@ static void build_lut(void) {
         residue_to_bit[wheel_residues[i]] = i;
 }
 
-/*
- * PrimeEntry: one entry in the binary state file (primes_state.bin).
+/* --- Bucket sieve helpers ---------------------------------------------- */
+
+/* Return bucket index for a given multiple (low 20 bits of segment num). */
+static uint64_t bucket_for(u128 m) {
+    u128 seg = (m - bucket_offset) / bucket_bufsize;
+    return (uint64_t)(seg & bucket_mask);
+}
+
+/* Bump-allocate one node from the pre-allocated pool. */
+static BucketNode *node_alloc(void) {
+    return &node_pool[node_pool_used++];
+}
+
+static void bucket_add(u128 p, u128 nm) {
+    BucketNode *n = node_alloc();
+    n->prime = p;
+    n->next_multiple = nm;
+    uint64_t bi = bucket_for(nm);
+    n->next = buckets[bi];
+    buckets[bi] = n;
+}
+
+/* (Re-)initialize the bucket system after bucket_offset/bufsize/target
+ * are set.  Allocates the bucket array; primes are added on-the-fly
+ * during extend_base_primes and process_segment. */
+static bool use_buckets = false;  /* only for large N (threshold in main) */
+
+static void bucket_init(void) {
+    node_pool_used = 0;
+    memset(buckets, 0, nbuckets * sizeof(BucketNode *));
+}
+
+/* --- PrimeEntry --------------------------------------------------------
  *   prime: a discovered prime value
  *   next:  first multiple of prime that falls in or after the
  *          current segment (used for resumability)
@@ -81,7 +158,6 @@ typedef struct {
 
 static PrimeEntry *base = NULL;
 static uint64_t base_count = 0;
-static uint64_t base_cap = 0;
 static u128 base_sieved = 0;
 
 static uint64_t total_count = 0;
@@ -263,13 +339,25 @@ static int read_entry(FILE *fp, PrimeEntry *e) {
 }
 
 static void add_base_prime(u128 p) {
-    if (base_count >= base_cap) {
-        base_cap = base_cap ? base_cap * 2 : 65536;
-        base = realloc(base, base_cap * sizeof(PrimeEntry));
-    }
     base[base_count].prime = p;
-    base[base_count].next = 0;
+    base[base_count].next = p * 2;
     base_count++;
+}
+
+/* Upper bound for π(x) using Rosser's theorem: π(x) < x / (ln x - 4)
+ * for x >= 55.  We use a binary-log approximation for ln(x) and add a
+ * 30 % safety margin to guarantee the allocation is large enough. */
+static uint64_t estimate_pi_max(u128 n) {
+    if (n < 55) return 100;
+    int bits = 0;
+    u128 tmp = n;
+    while (tmp) { bits++; tmp >>= 1; }
+    double ln_n = (bits - 1) * 0.6931471805599453;
+    double est = (double)n / (ln_n - 4.0);
+    if (est < 100) return 100;
+    uint64_t ret = (uint64_t)(est * 1.3) + 100000;
+    if (ret > 2000000000ULL) ret = 2000000000ULL;
+    return ret;
 }
 
 /*
@@ -374,6 +462,18 @@ static void extend_base_primes(u128 limit) {
                     r += step;
                     if (r >= WHEEL_MOD) { r -= WHEEL_MOD; block++; }
                 }
+
+                /* Bucket new prime for the main sieve */
+                if (buckets && n > (u128)7) {
+                    u128 next_m = n * n;
+                    if (next_m < bucket_offset) {
+                        next_m = bucket_offset;
+                        if (next_m % n != 0)
+                            next_m += n - next_m % n;
+                    }
+                    if (next_m <= bucket_target)
+                        bucket_add(n, next_m);
+                }
             }
         }
 
@@ -416,29 +516,69 @@ static void process_segment(FILE *state_fp, u128 seg_start, u128 seg_end,
     if (!buf) { fprintf(stderr, "Out of memory\n"); exit(1); }
     memset(buf, 0xFF, num_blocks * WHEEL_BYTES);
 
-    for (uint64_t i = 0; i < base_count; i++) {
-        u128 p = base[i].prime;
-        u128 fm = seg_start;
-        if (p * p > fm) fm = p * p;
-        if (fm > seg_end) continue;
-        if (fm % p != 0)
-            fm += p - fm % p;
-
-        u128 m = fm;
-        uint64_t step = (uint64_t)(p % WHEEL_MOD);
-        u128 blk_step = p / WHEEL_MOD;
-        uint64_t r = (uint64_t)(m % WHEEL_MOD);
-        u128 block = m / WHEEL_MOD;
-        while (m <= seg_end) {
-            uint8_t ri = residue_to_bit[r];
-            if (ri < WHEEL_SIZE) {
-                uint64_t b = (uint64_t)(block - first_block);
-                buf[b * WHEEL_BYTES + ri] = 0;
+    if (!use_buckets) {
+        /* Linear scan: iterate all base primes for every block */
+        for (uint64_t bi = 0; bi < base_count; bi++) {
+            u128 p = base[bi].prime;
+            u128 m = base[bi].next;
+            if (m > seg_end) continue;
+            uint64_t step = (uint64_t)(p % WHEEL_MOD);
+            u128 blk_step = p / WHEEL_MOD;
+            uint64_t r = (uint64_t)(m % WHEEL_MOD);
+            u128 block = m / WHEEL_MOD;
+            while (m <= seg_end) {
+                uint8_t ri = residue_to_bit[r];
+                if (ri < WHEEL_SIZE) {
+                    uint64_t b = (uint64_t)(block - first_block);
+                    if (b < num_blocks)
+                        buf[b * WHEEL_BYTES + ri] = 0;
+                }
+                m += p;
+                block += blk_step;
+                r += step;
+                if (r >= WHEEL_MOD) { r -= WHEEL_MOD; block++; }
             }
-            m += p;
-            block += blk_step;
-            r += step;
-            if (r >= WHEEL_MOD) { r -= WHEEL_MOD; block++; }
+            base[bi].next = m;
+        }
+    } else {
+        /* Bucket-driven Phase 1: process primes whose next_multiple
+         * falls in this segment, then re-bucket. */
+        uint64_t cur_bucket = ((seg_start - bucket_offset) / bucket_bufsize) & bucket_mask;
+        BucketNode *node = buckets[cur_bucket];
+        buckets[cur_bucket] = NULL;
+
+        while (node) {
+            BucketNode *next = node->next;
+            u128 p = node->prime;
+            u128 m = node->next_multiple;
+
+            if (m <= seg_end) {
+                uint64_t step = (uint64_t)(p % WHEEL_MOD);
+                u128 blk_step = p / WHEEL_MOD;
+                uint64_t r = (uint64_t)(m % WHEEL_MOD);
+                u128 block = m / WHEEL_MOD;
+                while (m <= seg_end) {
+                    uint8_t ri = residue_to_bit[r];
+                    if (ri < WHEEL_SIZE) {
+                        uint64_t b = (uint64_t)(block - first_block);
+                        buf[b * WHEEL_BYTES + ri] = 0;
+                    }
+                    m += p;
+                    block += blk_step;
+                    r += step;
+                    if (r >= WHEEL_MOD) { r -= WHEEL_MOD; block++; }
+                }
+                node->next_multiple = m;
+            }
+
+            u128 nm = node->next_multiple;
+            if (nm <= bucket_target) {
+                uint64_t bi = ((nm - bucket_offset) / bucket_bufsize) & bucket_mask;
+                node->next = buckets[bi];
+                buckets[bi] = node;
+            }
+
+            node = next;
         }
     }
 
@@ -465,24 +605,33 @@ static void process_segment(FILE *state_fp, u128 seg_start, u128 seg_end,
 
             u128 start_m = n * n;
             if (start_m < seg_start) start_m = seg_start;
-            if (start_m > seg_end) continue;
-            u128 m = start_m;
-            uint64_t step = (uint64_t)(n % WHEEL_MOD);
-            u128 blk_step = n / WHEEL_MOD;
-            uint64_t r = (uint64_t)(m % WHEEL_MOD);
-            u128 block = m / WHEEL_MOD;
-            while (m <= seg_end) {
-                uint8_t ri2 = residue_to_bit[r];
-                if (ri2 < WHEEL_SIZE) {
-                    uint64_t b = (uint64_t)(block - first_block);
-                    if (b < num_blocks)
-                        buf[b * WHEEL_BYTES + ri2] = 0;
+
+            u128 next_m;
+            if (start_m <= seg_end) {
+                u128 m = start_m;
+                uint64_t step = (uint64_t)(n % WHEEL_MOD);
+                u128 blk_step = n / WHEEL_MOD;
+                uint64_t r = (uint64_t)(m % WHEEL_MOD);
+                u128 block = m / WHEEL_MOD;
+                while (m <= seg_end) {
+                    uint8_t ri2 = residue_to_bit[r];
+                    if (ri2 < WHEEL_SIZE) {
+                        uint64_t b = (uint64_t)(block - first_block);
+                        if (b < num_blocks)
+                            buf[b * WHEEL_BYTES + ri2] = 0;
+                    }
+                    m += n;
+                    block += blk_step;
+                    r += step;
+                    if (r >= WHEEL_MOD) { r -= WHEEL_MOD; block++; }
                 }
-                m += n;
-                block += blk_step;
-                r += step;
-                if (r >= WHEEL_MOD) { r -= WHEEL_MOD; block++; }
+                next_m = m;
+            } else {
+                next_m = start_m;
             }
+
+            if (use_buckets && next_m <= bucket_target)
+                bucket_add(n, next_m);
         }
     }
 
@@ -684,37 +833,81 @@ int main(int argc, char **argv) {
     print_u128(buffer_size);
     printf("\n");
 
+    /* ----- Arena / memory pre-allocation ---------------------------------- */
+    {
+        u128 sqrt_target = sqrt_u128(target);
+        uint64_t max_base = estimate_pi_max(sqrt_target);
+        uint64_t max_nodes = max_base;
+
+        u128 est_segments = (target / buffer_size) + 2;
+        nbuckets = 1 << 20;
+        while (nbuckets < est_segments) {
+            if (nbuckets >= (1ULL << 26)) break;
+            nbuckets <<= 1;
+        }
+        bucket_mask = nbuckets - 1;
+
+        size_t arena_size =
+            max_base * sizeof(PrimeEntry) +
+            max_nodes * sizeof(BucketNode) +
+            nbuckets * sizeof(BucketNode *) +
+            FLUSH_BATCH * sizeof(PrimeEntry) +
+            256 * 1024 * 1024;
+
+        long pages = sysconf(_SC_PHYS_PAGES);
+        long pgsz = sysconf(_SC_PAGESIZE);
+        uint64_t avail = (uint64_t)pages * (uint64_t)pgsz / 2;
+        if (arena_size > avail) {
+            fprintf(stderr, "Target requires ~%zu bytes but only %llu available.\n",
+                    arena_size, (unsigned long long)avail);
+            return 1;
+        }
+
+        char *arena_base = malloc(arena_size);
+        if (!arena_base) {
+            fprintf(stderr, "Out of memory\n");
+            return 1;
+        }
+        aren.base = arena_base;
+        aren.ptr = arena_base;
+        aren.end = arena_base + arena_size;
+
+        base = arena_alloc(&aren, max_base * sizeof(PrimeEntry));
+        node_pool = arena_alloc(&aren, max_nodes * sizeof(BucketNode));
+        buckets = arena_alloc(&aren, nbuckets * sizeof(BucketNode *));
+        write_buf = arena_alloc(&aren, FLUSH_BATCH * sizeof(PrimeEntry));
+        memset(buckets, 0, nbuckets * sizeof(BucketNode *));
+    }
+
     FILE *state_fp = NULL;
     if (!count_only || save_state) {
         if (resume_mode) {
             state_fp = fopen(FILENAME, "rb+");
             if (!state_fp) {
                 perror("Failed to open " FILENAME " for resume");
-                return 1;
+                goto fail;
             }
             fseek(state_fp, state_entry_count * 32, SEEK_SET);
         } else {
             state_fp = fopen(FILENAME, "wb+");
             if (!state_fp) {
                 perror("Failed to open state file");
-                return 1;
+                goto fail;
             }
-        }
-        write_buf = malloc(FLUSH_BATCH * sizeof(PrimeEntry));
-        if (!write_buf) {
-            fprintf(stderr, "Out of memory\n");
-            if (state_fp) fclose(state_fp);
-            return 1;
         }
     }
 
     FILE *output_fp = NULL;
     if (output_filename) {
-        output_fp = fopen(output_filename, "w");
-        if (!output_fp) {
-            perror("Failed to open output file");
-            if (state_fp) fclose(state_fp);
-            return 1;
+        if (strcmp(output_filename, "-") == 0) {
+            output_fp = stdout;
+        } else {
+            output_fp = fopen(output_filename, "w");
+            if (!output_fp) {
+                perror("Failed to open output file");
+                if (state_fp) fclose(state_fp);
+                goto fail;
+            }
         }
     }
 
@@ -759,6 +952,15 @@ int main(int argc, char **argv) {
         }
     }
 
+    /* Initialize bucket sieve (only for targets > 10^11) */
+    use_buckets = (target > 100000000000ULL);
+    if (use_buckets) {
+        bucket_offset = resume_mode ? res_last + 1 : 2;
+        bucket_bufsize = buffer_size;
+        bucket_target = target;
+        bucket_init();
+    }
+
     while (current <= target) {
         u128 seg_end = current + buffer_size - 1;
         if (seg_end > target) seg_end = target;
@@ -797,9 +999,16 @@ int main(int argc, char **argv) {
                          state_entry_count);
         fclose(state_fp);
     }
-    free(write_buf);
     if (output_fp) fclose(output_fp);
 
-    free(base);
+    free(aren.base);
+    aren.base = NULL;
+    aren.ptr = NULL;
+    aren.end = NULL;
     return 0;
+
+fail:
+    free(aren.base);
+    arena_reset();
+    return 1;
 }
