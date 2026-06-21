@@ -38,26 +38,16 @@
 typedef unsigned __int128 u128;
 
 #define FILENAME "primes_state.bin"
-#define WHEEL_MOD 210
-#define WHEEL_SIZE 48
-#define WHEEL_BYTES 48
+#define CHECKPOINT_FILE "primes_state.ckpt"
+#define CHECKPOINT_MAGIC ((uint64_t)0x4553554D45525F4D)
 
-/*
- * mod-210 wheel residues: numbers < 210 that are coprime to 210.
- * 210 = 2 * 3 * 5 * 7, so these 48 residues are not divisible by
- * 2, 3, 5, or 7 — the only possible prime values modulo 210.
- * Every prime >= 11 falls into exactly one of these residues.
- * This eliminates 77% of candidates before sieving begins.
- */
-static const uint64_t wheel_residues[WHEEL_SIZE] = {
-    1, 11, 13, 17, 19, 23, 29, 31, 37, 41, 43, 47,
-    53, 59, 61, 67, 71, 73, 79, 83, 89, 97,
-    101, 103, 107, 109, 113, 121, 127, 131,
-    137, 139, 143, 149, 151, 157, 163, 167, 169, 173,
-    179, 181, 187, 191, 193, 197, 199, 209
-};
-
-static uint8_t residue_to_bit[WHEEL_MOD];
+static uint64_t WHEEL_MOD = 210;
+static uint64_t WHEEL_SIZE = 48;
+static uint64_t WHEEL_BYTES = 48;
+static uint64_t *wheel_residues = NULL;
+static uint16_t *residue_to_bit = NULL;
+static uint64_t *wheel_primes = NULL;
+static int num_wheel_primes = 0;
 
 /*
  * Bucket sieve: instead of iterating over ALL π(√N) base primes per
@@ -104,11 +94,64 @@ static u128 bucket_offset = 0;      /* first number of first segment */
 static u128 bucket_bufsize = 0;     /* copy of buffer_size */
 static u128 bucket_target = 0;      /* overall target (for drop check) */
 
-static void build_lut(void) {
-    for (int i = 0; i < WHEEL_MOD; i++)
-        residue_to_bit[i] = 0xFF;
-    for (int i = 0; i < WHEEL_SIZE; i++)
-        residue_to_bit[wheel_residues[i]] = i;
+static void generate_wheel(uint64_t mod) {
+    static const uint64_t valid_wheels[] = {2, 6, 30, 210, 2310};
+    int valid = 0;
+    for (size_t i = 0; i < sizeof(valid_wheels)/sizeof(valid_wheels[0]); i++) {
+        if (valid_wheels[i] == mod) { valid = 1; break; }
+    }
+    if (!valid) {
+        fprintf(stderr, "Invalid wheel modulus: %llu (must be 2, 6, 30, 210, or 2310)\n", mod);
+        exit(1);
+    }
+
+    WHEEL_MOD = mod;
+
+    uint64_t tmp = mod;
+    num_wheel_primes = 0;
+    for (uint64_t p = 2; p * p <= tmp; p++) {
+        if (tmp % p == 0) {
+            num_wheel_primes++;
+            while (tmp % p == 0) tmp /= p;
+        }
+    }
+    if (tmp > 1) num_wheel_primes++;
+
+    wheel_primes = malloc(num_wheel_primes * sizeof(uint64_t));
+    if (!wheel_primes) { fprintf(stderr, "Out of memory\n"); exit(1); }
+
+    tmp = mod;
+    int idx = 0;
+    for (uint64_t p = 2; p * p <= tmp; p++) {
+        if (tmp % p == 0) {
+            wheel_primes[idx++] = p;
+            while (tmp % p == 0) tmp /= p;
+        }
+    }
+    if (tmp > 1) wheel_primes[idx++] = tmp;
+
+    WHEEL_SIZE = 0;
+    for (uint64_t i = 1; i < mod; i++) {
+        uint64_t g = i, t = mod;
+        while (t) { uint64_t r = g % t; g = t; t = r; }
+        if (g == 1) WHEEL_SIZE++;
+    }
+
+    wheel_residues = malloc(WHEEL_SIZE * sizeof(uint64_t));
+    residue_to_bit = malloc(WHEEL_MOD * sizeof(uint16_t));
+    if (!wheel_residues || !residue_to_bit) { fprintf(stderr, "Out of memory\n"); exit(1); }
+
+    WHEEL_BYTES = WHEEL_SIZE;
+
+    idx = 0;
+    for (uint64_t i = 1; i < mod; i++) {
+        uint64_t g = i, t = mod;
+        while (t) { uint64_t r = g % t; g = t; t = r; }
+        if (g == 1) wheel_residues[idx++] = i;
+    }
+
+    for (uint64_t i = 0; i < WHEEL_MOD; i++) residue_to_bit[i] = 0xFFFF;
+    for (uint64_t i = 0; i < WHEEL_SIZE; i++) residue_to_bit[wheel_residues[i]] = (uint16_t)i;
 }
 
 /* --- Bucket sieve helpers ---------------------------------------------- */
@@ -295,6 +338,10 @@ static void checkpoint_write(u128 last_sieved, u128 original_target,
     uint64_t magic = CHECKPOINT_MAGIC;
     fwrite(&magic, 8, 1, fp);
 
+    /* wheel_mod — validates resume uses same wheel */
+    uint64_t wheel = WHEEL_MOD;
+    fwrite(&wheel, 8, 1, fp);
+
     fclose(fp);
 
     /* Atomic replacement: the rename(2) is POSIX-atomic on the same
@@ -322,6 +369,16 @@ static int checkpoint_read(u128 *last_sieved, u128 *original_target,
 
     if (fread(&magic, 8, 1, fp) != 1) { fclose(fp); return 0; }
     if (magic != CHECKPOINT_MAGIC)    { fclose(fp); return 0; }
+
+    /* wheel_mod — validate resume uses same wheel */
+    uint64_t saved_wheel;
+    if (fread(&saved_wheel, 8, 1, fp) != 1) { fclose(fp); return 0; }
+    if (saved_wheel != WHEEL_MOD) {
+        fprintf(stderr, "Checkpoint wheel mismatch: saved=%llu, current=%llu\n",
+                saved_wheel, WHEEL_MOD);
+        fclose(fp);
+        return 0;
+    }
 
     fclose(fp);
     return 1;
@@ -379,12 +436,11 @@ static void extend_base_primes(u128 limit) {
     if (limit > (u128)1 << 62) limit = (u128)1 << 62;
 
     if (base_count == 0) {
-        add_base_prime(2);
-        add_base_prime(3);
-        add_base_prime(5);
-        add_base_prime(7);
-        base_sieved = 7;
-        if (limit <= 7) return;
+        for (int i = 0; i < num_wheel_primes; i++) {
+            add_base_prime((u128)wheel_primes[i]);
+        }
+        base_sieved = wheel_primes[num_wheel_primes - 1];
+        if (limit <= base_sieved) return;
     }
 
     while (base_sieved < limit) {
@@ -411,7 +467,6 @@ static void extend_base_primes(u128 limit) {
 
         for (uint64_t bi = 0; bi < base_count; bi++) {
             u128 p = base[bi].prime;
-            if (p < 11) continue;
             u128 fm = start;
             if (p * p > fm) fm = p * p;
             if (fm > end) continue;
@@ -423,7 +478,7 @@ static void extend_base_primes(u128 limit) {
             uint64_t r = (uint64_t)(m % WHEEL_MOD);
             u128 block = m / WHEEL_MOD;
             while (m <= end) {
-                uint8_t ri = residue_to_bit[r];
+                uint16_t ri = residue_to_bit[r];
                 if (ri < WHEEL_SIZE) {
                     uint64_t buf_i = (uint64_t)(block - first_block);
                     buf[buf_i * WHEEL_BYTES + ri] = 0;
@@ -451,7 +506,7 @@ static void extend_base_primes(u128 limit) {
                 uint64_t r = (uint64_t)(m % WHEEL_MOD);
                 u128 block = m / WHEEL_MOD;
                 while (m <= end) {
-                    uint8_t ri2 = residue_to_bit[r];
+                    uint16_t ri2 = residue_to_bit[r];
                     if (ri2 < WHEEL_SIZE) {
                         uint64_t b = (uint64_t)(block - first_block);
                         if (b < num_blocks)
@@ -464,7 +519,7 @@ static void extend_base_primes(u128 limit) {
                 }
 
                 /* Bucket new prime for the main sieve */
-                if (buckets && n > (u128)7) {
+                if (use_buckets && buckets && n > (u128)wheel_primes[num_wheel_primes - 1]) {
                     u128 next_m = n * n;
                     if (next_m < bucket_offset) {
                         next_m = bucket_offset;
@@ -527,7 +582,7 @@ static void process_segment(FILE *state_fp, u128 seg_start, u128 seg_end,
             uint64_t r = (uint64_t)(m % WHEEL_MOD);
             u128 block = m / WHEEL_MOD;
             while (m <= seg_end) {
-                uint8_t ri = residue_to_bit[r];
+                uint16_t ri = residue_to_bit[r];
                 if (ri < WHEEL_SIZE) {
                     uint64_t b = (uint64_t)(block - first_block);
                     if (b < num_blocks)
@@ -558,7 +613,7 @@ static void process_segment(FILE *state_fp, u128 seg_start, u128 seg_end,
                 uint64_t r = (uint64_t)(m % WHEEL_MOD);
                 u128 block = m / WHEEL_MOD;
                 while (m <= seg_end) {
-                    uint8_t ri = residue_to_bit[r];
+                    uint16_t ri = residue_to_bit[r];
                     if (ri < WHEEL_SIZE) {
                         uint64_t b = (uint64_t)(block - first_block);
                         buf[b * WHEEL_BYTES + ri] = 0;
@@ -614,7 +669,7 @@ static void process_segment(FILE *state_fp, u128 seg_start, u128 seg_end,
                 uint64_t r = (uint64_t)(m % WHEEL_MOD);
                 u128 block = m / WHEEL_MOD;
                 while (m <= seg_end) {
-                    uint8_t ri2 = residue_to_bit[r];
+                    uint16_t ri2 = residue_to_bit[r];
                     if (ri2 < WHEEL_SIZE) {
                         uint64_t b = (uint64_t)(block - first_block);
                         if (b < num_blocks)
@@ -677,7 +732,8 @@ static void format_duration(double sec, char *buf, size_t sz) {
 }
 
 static void print_help(void) {
-    printf("Usage: fastsieve [buffer_size] [target] [-c] [-s] [-r] [-R] [-o file]\n");
+    printf("Usage: fastsieve [--wheel N] [buffer_size] [target] [-c] [-s] [-r] [-R] [-o file]\n");
+    printf("  --wheel N    wheel modulus: 2, 6, 30, 210 (default), 2310\n");
     printf("  buffer_size  segment window size in natural numbers (optional, auto-opt)\n");
     printf("  target       sieve up to this number (required for sieve, report, or resume)\n");
     printf("  -c           count only (no state file, faster)\n");
@@ -688,7 +744,21 @@ static void print_help(void) {
 }
 
 int main(int argc, char **argv) {
-    build_lut();
+    for (int i = 1; i < argc; i++) {
+        if (strcmp(argv[i], "--wheel") == 0 && i + 1 < argc) {
+            u128 val;
+            if (!parse_u128(argv[i + 1], &val)) {
+                fprintf(stderr, "Invalid wheel value: %s\n", argv[i + 1]);
+                return 1;
+            }
+            WHEEL_MOD = (uint64_t)val;
+        }
+    }
+    if (WHEEL_MOD != 2 && WHEEL_MOD != 6 && WHEEL_MOD != 30 && WHEEL_MOD != 210 && WHEEL_MOD != 2310) {
+        fprintf(stderr, "Invalid wheel: %llu (must be 2, 6, 30, 210, or 2310)\n", WHEEL_MOD);
+        return 1;
+    }
+    generate_wheel(WHEEL_MOD);
 
     u128 target = 0;
     u128 buffer_size = 0;
@@ -700,6 +770,10 @@ int main(int argc, char **argv) {
 
     int num_count = 0;
     for (int i = 1; i < argc; i++) {
+        if (strcmp(argv[i], "--wheel") == 0) {
+            i++;
+            continue;
+        }
         if (strcmp(argv[i], "-c") == 0) {
             count_only = 1;
         } else if (strcmp(argv[i], "-s") == 0) {
@@ -872,7 +946,9 @@ int main(int argc, char **argv) {
         aren.ptr = arena_base;
         aren.end = arena_base + arena_size;
 
-        base = arena_alloc(&aren, max_base * sizeof(PrimeEntry));
+        /* Aligned alloc for cache-line friendly access (64-byte alignment) */
+        base = aligned_alloc(64, max_base * sizeof(PrimeEntry));
+        if (!base) { fprintf(stderr, "Out of memory\n"); return 1; }
         node_pool = arena_alloc(&aren, max_nodes * sizeof(BucketNode));
         buckets = arena_alloc(&aren, nbuckets * sizeof(BucketNode *));
         write_buf = arena_alloc(&aren, FLUSH_BATCH * sizeof(PrimeEntry));
@@ -926,36 +1002,48 @@ int main(int argc, char **argv) {
         printf("\n");
     }
 
-    /* Primes 2,3,5,7 define the wheel and are NOT in the wheel
+    /* Wheel primes define the wheel and are NOT in the wheel
      * residues (they'd be excluded as wheel divisors). Count and
      * write them explicitly before the segmented loop begins.
      * Skipped in resume mode — they are already in the state file. */
+    u128 first_segment_start = 2;
+    u128 last_wheel_prime = 0;
     if (!resume_mode) {
-        static const u128 small_primes[] = {2, 3, 5, 7};
-        for (int i = 0; i < 4; i++) {
-            if (small_primes[i] > target) continue;
+        for (int i = 0; i < num_wheel_primes; i++) {
+            if (wheel_primes[i] > target) continue;
             total_count++;
+            last_wheel_prime = wheel_primes[i];
             if (state_fp) {
-                PrimeEntry e = {small_primes[i], small_primes[i] * 2};
+                PrimeEntry e = {wheel_primes[i], (u128)wheel_primes[i] * 2};
                 buffer_entry(state_fp, &e);
             }
             if (output_fp) {
-                print_u128_f(output_fp, small_primes[i]);
+                print_u128_f(output_fp, (u128)wheel_primes[i]);
                 fputc('\n', output_fp);
             }
         }
-        /* Initial checkpoint right after small primes */
+        first_segment_start = last_wheel_prime + 1;
+        /* Initial checkpoint right after wheel primes */
         if (state_fp) {
             flush_entries(state_fp);
-            checkpoint_write(7, original_target, total_count,
+            checkpoint_write(last_wheel_prime, original_target, total_count,
                              state_entry_count);
         }
+    } else {
+        first_segment_start = current;
+    }
+    /* Initialize base primes up to sqrt(target) before main sieve */
+    extend_base_primes(sqrt_u128(target));
+    /* Start main sieve after the wheel primes (not base_sieved) - only for fresh run */
+    if (!resume_mode) {
+        current = (u128)wheel_primes[num_wheel_primes - 1] + 1;
     }
 
     /* Initialize bucket sieve (only for targets > 10^11) */
     use_buckets = (target > 100000000000ULL);
     if (use_buckets) {
-        bucket_offset = resume_mode ? res_last + 1 : 2;
+        u128 first_after_wheel = (u128)wheel_primes[num_wheel_primes - 1] + 1;
+        bucket_offset = resume_mode ? res_last + 1 : first_after_wheel;
         bucket_bufsize = buffer_size;
         bucket_target = target;
         bucket_init();
@@ -964,10 +1052,6 @@ int main(int argc, char **argv) {
     while (current <= target) {
         u128 seg_end = current + buffer_size - 1;
         if (seg_end > target) seg_end = target;
-
-        sqrt_cur = sqrt_u128(seg_end);
-        if (sqrt_cur > base_sieved)
-            extend_base_primes(sqrt_cur);
 
         process_segment(state_fp, current, seg_end, output_fp);
 
@@ -1001,13 +1085,15 @@ int main(int argc, char **argv) {
     }
     if (output_fp) fclose(output_fp);
 
+    free(base);
     free(aren.base);
     aren.base = NULL;
     aren.ptr = NULL;
-    aren.end = NULL;
+    aren.end = NULL;;
     return 0;
 
 fail:
+    free(base);
     free(aren.base);
     arena_reset();
     return 1;

@@ -1,8 +1,9 @@
-# fastsieve — mod-210 Wheel Segmented Prime Sieve
+# fastsieve — Configurable Wheel Segmented Prime Sieve
 
 **fastsieve** counts and enumerates primes in large ranges using a
-segmented Sieve of Eratosthenes with mod-210 wheel factorization and
-128-bit integers.  It can sieve up to ~10³⁸, limited only by time.
+segmented Sieve of Eratosthenes with configurable wheel factorization
+(mod 2, 6, 30, 210, or 2310) and 128-bit integers.  It can sieve up to
+~10³⁸, limited only by time.
 
 ## Algorithm
 
@@ -21,14 +22,26 @@ For each window:
 3. Scan the window for survivors — each survivor is a new prime
 4. Buffer discovered primes in memory; flush to state file in 65K-entry batches
 
-### mod-210 Wheel
+### Configurable Wheel Factorization
 
-Numbers divisible by 2, 3, 5, or 7 can never be prime (except 2, 3,
-5, 7 themselves).  The wheel pre-excludes them: of every 210
-consecutive integers, only 48 residues are coprime to 210 and need
-to be checked.  This reduces the candidate set by **77%**.
+Numbers divisible by the first k primes can never be prime (except
+those primes themselves).  The wheel pre-excludes them: of every
+W consecutive integers (where W is the primorial), only φ(W) residues
+are coprime to W and need to be checked.
 
-The 48 residues are:
+| Wheel (--wheel) | Primorial | Primes in Wheel | Residues | % Candidates | % Removed |
+|---|---|---|---|---|---|
+| 2 | 2 | {2} | 1 | 50% | 50% |
+| 6 | 2×3 | {2,3} | 2 | 33.3% | 66.7% |
+| 30 | 2×3×5 | {2,3,5} | 8 | 26.7% | 73.3% |
+| **210** (default) | **2×3×5×7** | **{2,3,5,7}** | **48** | **22.9%** | **77.1%** |
+| 2310 | 2×3×5×7×11 | {2,3,5,7,11} | 480 | 20.8% | 79.2% |
+
+The default `--wheel 210` offers the best balance of candidate reduction
+vs. overhead on modern CPUs.  Larger wheels (2310) reduce candidates
+further but increase modulus overhead and LUT size.
+
+The wheel residues for the default mod-210 wheel are:
 
 ```
 1, 11, 13, 17, 19, 23, 29, 31, 37, 41, 43, 47,
@@ -82,11 +95,12 @@ Requires GCC or Clang on a 64-bit platform (for `__int128` support).
 ## Usage
 
 ```sh
-./fastsieve [buffer_size] [target] [-c] [-s] [-r] [-R] [-o file]
+./fastsieve [--wheel N] [buffer_size] [target] [-c] [-s] [-r] [-R] [-o file]
 ```
 
 | Argument | Description |
 |---|---|---|
+| `--wheel N` | Wheel modulus: 2, 6, 30, **210** (default), 2310 |
 | `buffer_size` | Segment window in natural numbers (optional, auto-optimized to ~143K) |
 | `target` | Sieve up to this number (required for sieve, report, and resume) |
 | `-c` | Count only — no state file, faster for large targets |
@@ -111,6 +125,8 @@ Requires GCC or Clang on a 64-bit platform (for `__int128` support).
 | `./fastsieve -R -c 50000000` | Resume, count only — no state writes, fastest |
 | `./fastsieve -R 5000000` | Target ≤ last sieved → no-op, prints existing count |
 | `./fastsieve -R 50000000` *(after crash)* | Resume from last committed checkpoint; re-processes ≤10 segments |
+| `./fastsieve --wheel 30 1000000000 -c` | Count primes with mod-30 wheel |
+| `./fastsieve --wheel 2310 1000000000 -c` | Count primes with mod-2310 wheel |
 | `./fastsieve -c -r` | Error (mutually exclusive) |
 | `./fastsieve -R -r` | Error (mutually exclusive) |
 | `./fastsieve` | Print help |
@@ -197,7 +213,7 @@ Where `prime = (hi << 64) | lo` and `next` is the first multiple of
 
 ### Checkpoint File
 
-`primes_state.ckpt` (48 bytes) stores the last committed resume position.
+`primes_state.ckpt` (64 bytes) stores the last committed resume position.
 Updated atomically every 10 segments.
 
 ```
@@ -208,6 +224,7 @@ offset 24: entry_count (uint64_t)
 offset 32: original_target_lo (uint64_t, little-endian)
 offset 40: original_target_hi (uint64_t, little-endian)
 offset 48: magic (uint64_t = 0x4553554D45525F4D)
+offset 56: wheel_mod (uint64_t)  — validates resume uses same wheel
 ```
 
 - `last_sieved` — last number fully processed; resume continues from here + 1.
@@ -219,6 +236,8 @@ offset 48: magic (uint64_t = 0x4553554D45525F4D)
   smaller, a warning is printed.
 - `magic` — distinguishes a valid checkpoint from arbitrary data
   (`0x4553554D45525F4D` ≙ `"M_RESUME"`).
+- `wheel_mod` — wheel modulus used for the sieve.  Resume with a different
+  `--wheel` value will error.
 
 ## Files
 
