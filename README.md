@@ -108,6 +108,8 @@ Requires GCC or Clang on a 64-bit platform (for `__int128` support).
 | `-r` | Report from existing `primes_state.bin` (no sieving) |
 | `-R` | Resume from checkpoint — load `primes_state.ckpt`, continue sieving from the last committed position (requires target > last sieved). State file is appended to automatically (unless `-c`). |
 | `-o file` | Write all discovered primes to a file (use `-` for stdout) |
+| `--hash-output file` | Write streamed SHA-256 hash of prime list to `<file>.sha256` (also writes primes to `file` for streaming; combine with `-o` for separate output) |
+| `--verify-hash file` | Verify `file` against its `<file>.sha256` — reads file, computes SHA-256, compares to stored hash |
 
 ### Examples
 
@@ -129,6 +131,9 @@ Requires GCC or Clang on a 64-bit platform (for `__int128` support).
 | `./fastsieve --wheel 2310 1000000000 -c` | Count primes with mod-2310 wheel |
 | `./fastsieve -c -r` | Error (mutually exclusive) |
 | `./fastsieve -R -r` | Error (mutually exclusive) |
+| `./fastsieve -o primes.txt --hash-output primes.txt 1000000` | Write primes + compute SHA-256, save hash to `primes.txt.sha256` |
+| `./fastsieve --verify-hash primes.txt` | Verify `primes.txt` against its `.sha256` file |
+| `zcat primes_1e9.txt.gz \| ./fastsieve --verify-hash -` | Verify compressed prime list via streaming |
 | `./fastsieve` | Print help |
 
 ## Performance
@@ -248,4 +253,17 @@ README.md            — this file
 primes_state.bin     — state file (generated, git-ignored)
 primes_state.ckpt    — resume checkpoint (generated, git-ignored)
 output/              — optional output directory for -o files
+psvh/primes/         — PSVH reference files (compressed, git-ignored)
+psvh/counts/         — prime count records
+psvh/hashes/         — hash verification records
 ```
+
+## Prime Sieve Validation Hash (PSVH)
+
+PSVH is a cryptographic verification standard for prime lists generated
+by fastsieve.  The canonical hash is SHA-256 of the uncompressed decimal
+prime list (one per line, Unix LF, no trailing newline on the last line).
+
+Reference files are generated with `--wheel 30` and distributed as
+`gzip -9` compressed archives.  See [PSVH_SPEC.md](PSVH_SPEC.md) for the
+full standard and [psvh/](psvh/) for reference files.

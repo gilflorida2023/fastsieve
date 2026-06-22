@@ -2,7 +2,7 @@ CFLAGS = -O3 -pipe -Wall -Wextra
 LDFLAGS =
 TARGET = fastsieve
 
-.PHONY: all clean test bench-wheels
+.PHONY: all clean test bench-wheels psvh-gen psvh-verify
 
 all: $(TARGET)
 
@@ -71,3 +71,33 @@ bench-wheels: $(TARGET)
 		fi; \
 	done < /tmp/bench_times.$$; \
 	rm -f /tmp/bench_times.$$
+
+# PSVH reference generation
+PSVH_DIR = psvh/primes
+
+psvh-gen: $(TARGET)
+	@mkdir -p $(PSVH_DIR)
+	@for n in 3 4 5 6 7 8 9; do \
+		target=$$((10**n)); \
+		echo "Generating primes_1e$${n}.txt ..."; \
+		./$(TARGET) --wheel 30 -o $(PSVH_DIR)/primes_1e$${n}.txt \
+			--hash-output $(PSVH_DIR)/primes_1e$${n}.txt $$target >/dev/null 2>&1; \
+		gzip -9 $(PSVH_DIR)/primes_1e$${n}.txt; \
+	done
+	@echo "Done. Files in $(PSVH_DIR)/"
+
+psvh-verify: $(TARGET)
+	@failed=0; \
+	for f in $(PSVH_DIR)/primes_1e*.txt.gz; do \
+		base=$$(basename "$$f" .gz); \
+		dir=$$(dirname "$$f"); \
+		hash=$$(cat "$$dir/$$base.sha256" | awk '{print $$1}'); \
+		computed=$$(zcat "$$f" | ./$(TARGET) --verify-hash - 2>&1 | grep -o '[0-9a-f]\{64\}'); \
+		if [ "$$hash" = "$$computed" ]; then \
+			echo "  PASS: $$base"; \
+		else \
+			echo "  FAIL: $$base (expected $$hash, got $$computed)"; \
+			failed=1; \
+		fi; \
+	done; \
+	exit $$failed

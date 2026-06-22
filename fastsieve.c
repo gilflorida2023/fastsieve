@@ -919,6 +919,12 @@ static void print_help(void) {
     printf("  -r           report from existing primes_state.bin (no sieve)\n");
     printf("  -R           resume from checkpoint (requires target > last sieved)\n");
     printf("  -o file      write primes to file (use \"-\" for stdout)\n");
+    printf("  --hash-output file\n");
+    printf("               write streamed hash of prime list to <file>.sha256\n");
+    printf("               (writes prime list to same file; use with -o for separate output)\n");
+    printf("  --verify-hash file\n");
+    printf("               verify prime list file against its .sha256 hash\n");
+    printf("               (reads file, computes SHA-256, compares to <file>.sha256)\n");
 }
 
 int main(int argc, char **argv) {
