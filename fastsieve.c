@@ -29,6 +29,7 @@
 #include <stdbool.h>
 #include <time.h>
 #include <unistd.h>
+#include <ctype.h>
 
 /*
  * unsigned __int128 is a GCC/Clang extension providing 128-bit integers.
@@ -40,6 +41,159 @@ typedef unsigned __int128 u128;
 #define FILENAME "primes_state.bin"
 #define CHECKPOINT_FILE "primes_state.ckpt"
 #define CHECKPOINT_MAGIC ((uint64_t)0x4553554D45525F4D)
+
+/* SHA256 for hash output mode */
+#define SHA256_BLOCK_SIZE 64
+#define SHA256_DIGEST_SIZE 32
+
+typedef struct {
+    uint32_t state[8];
+    uint64_t count;
+    uint8_t buffer[SHA256_BLOCK_SIZE];
+} SHA256_CTX;
+
+static const uint32_t K[64] = {
+    0x428a2f98, 0x71374491, 0xb5c0fbcf, 0xe9b5dba5, 0x3956c25b, 0x59f111f1, 0x923f82a4, 0xab1c5ed5,
+    0xd807aa98, 0x12835b01, 0x243185be, 0x550c7dc3, 0x72be5d74, 0x80deb1fe, 0x9bdc06a7, 0xc19bf174,
+    0xe49b69c1, 0xefbe4786, 0x0fc19dc6, 0x240ca1cc, 0x2de92c6f, 0x4a7484aa, 0x5cb0a9dc, 0x76f988da,
+    0x983e5152, 0xa831c66d, 0xb00327c8, 0xbf597fc7, 0xc6e00bf3, 0xd5a79147, 0x06ca6351, 0x14292967,
+    0x27b70a85, 0x2e1b2138, 0x4d2c6dfc, 0x53380d13, 0x650a7354, 0x766a0abb, 0x81c2c92e, 0x92722c85,
+    0xa2bfe8a1, 0xa81a664b, 0xc24b8b70, 0xc76c51a3, 0xd192e819, 0xd6990624, 0xf40e3585, 0x106aa070,
+    0x19a4c116, 0x1e376c08, 0x2748774c, 0x34b0bcb5, 0x391c0cb3, 0x4ed8aa4a, 0x5b9cca4f, 0x682e6ff3,
+    0x748f82ee, 0x78a5636f, 0x84c87814, 0x8cc70208, 0x90befffa, 0xa4506ceb, 0xbef9a3f7, 0xc67178f2
+};
+
+#define ROTR(x,n) (((x) >> (n)) | ((x) << (32 - (n))))
+#define SHR(x,n) ((x) >> (n))
+#define SIG0(x) (ROTR(x,2) ^ ROTR(x,13) ^ ROTR(x,22))
+#define SIG1(x) (ROTR(x,6) ^ ROTR(x,11) ^ ROTR(x,25))
+#define EP0(x) (ROTR(x,7) ^ ROTR(x,18) ^ SHR(x,3))
+#define EP1(x) (ROTR(x,17) ^ ROTR(x,19) ^ SHR(x,10))
+#define CH(x,y,z) (((x) & (y)) ^ (~(x) & (z)))
+#define MAJ(x,y,z) (((x) & (y)) ^ ((x) & (z)) ^ ((y) & (z)))
+
+static void sha256_init(SHA256_CTX *ctx) {
+    ctx->state[0] = 0x6a09e667;
+    ctx->state[1] = 0xbb67ae85;
+    ctx->state[2] = 0x3c6ef372;
+    ctx->state[3] = 0xa54ff53a;
+    ctx->state[4] = 0x510e527f;
+    ctx->state[5] = 0x9b05688c;
+    ctx->state[6] = 0x1f83d9ab;
+    ctx->state[7] = 0x5be0cd19;
+    ctx->count = 0;
+}
+
+static void sha256_transform(SHA256_CTX *ctx, const uint8_t *data) {
+    uint32_t a, b, c, d, e, f, g, h, i, j, t1, t2;
+    uint32_t m[64];
+
+    for (i = 0, j = 0; i < 16; i++, j += 4) {
+        m[i] = ((uint32_t)data[j] << 24) | ((uint32_t)data[j+1] << 16) |
+               ((uint32_t)data[j+2] << 8) | ((uint32_t)data[j+3]);
+    }
+    for (; i < 64; i++) {
+        m[i] = EP1(m[i-2]) + m[i-7] + EP0(m[i-15]) + m[i-16];
+    }
+
+    a = ctx->state[0];
+    b = ctx->state[1];
+    c = ctx->state[2];
+    d = ctx->state[3];
+    e = ctx->state[4];
+    f = ctx->state[5];
+    g = ctx->state[6];
+    h = ctx->state[7];
+
+    for (i = 0; i < 64; i++) {
+        t1 = h + SIG1(e) + CH(e,f,g) + K[i] + m[i];
+        t2 = SIG0(a) + MAJ(a,b,c);
+        h = g;
+        g = f;
+        f = e;
+        e = d + t1;
+        d = c;
+        c = b;
+        b = a;
+        a = t1 + t2;
+    }
+
+    ctx->state[0] += a;
+    ctx->state[1] += b;
+    ctx->state[2] += c;
+    ctx->state[3] += d;
+    ctx->state[4] += e;
+    ctx->state[5] += f;
+    ctx->state[6] += g;
+    ctx->state[7] += h;
+}
+
+static void sha256_update(SHA256_CTX *ctx, const uint8_t *data, size_t len) {
+    size_t i;
+    for (i = 0; i < len; ) {
+        if (ctx->count % SHA256_BLOCK_SIZE == 0 && len - i >= SHA256_BLOCK_SIZE) {
+            sha256_transform(ctx, data + i);
+            ctx->count += SHA256_BLOCK_SIZE;
+            i += SHA256_BLOCK_SIZE;
+        } else {
+            ctx->buffer[ctx->count % SHA256_BLOCK_SIZE] = data[i];
+            ctx->count++;
+            i++;
+            if (ctx->count % SHA256_BLOCK_SIZE == 0) {
+                sha256_transform(ctx, ctx->buffer);
+            }
+        }
+    }
+}
+
+static void sha256_final(SHA256_CTX *ctx, uint8_t *hash) {
+    size_t i;
+    uint64_t bit_count = ctx->count * 8;
+
+    /* Pad with 0x80 */
+    sha256_update(ctx, (uint8_t*)"\x80", 1);
+
+    /* Pad with zeros until 56 bytes mod 64 */
+    while (ctx->count % SHA256_BLOCK_SIZE != 56) {
+        sha256_update(ctx, (uint8_t*)"\x00", 1);
+    }
+
+    /* Append bit count as big-endian 64-bit */
+    uint8_t bits[8];
+    for (i = 0; i < 8; i++) {
+        bits[7-i] = (uint8_t)(bit_count >> (i * 8));
+    }
+    sha256_update(ctx, bits, 8);
+
+    /* Output hash */
+    for (i = 0; i < 8; i++) {
+        hash[4*i]   = (uint8_t)(ctx->state[i] >> 24);
+        hash[4*i+1] = (uint8_t)(ctx->state[i] >> 16);
+        hash[4*i+2] = (uint8_t)(ctx->state[i] >> 8);
+        hash[4*i+3] = (uint8_t)(ctx->state[i]);
+    }
+}
+
+static void sha256_hash_file(const char *filename, uint8_t *hash) {
+    FILE *fp = fopen(filename, "rb");
+    if (!fp) return;
+    SHA256_CTX ctx;
+    sha256_init(&ctx);
+    uint8_t buf[8192];
+    size_t n;
+    while ((n = fread(buf, 1, sizeof(buf), fp)) > 0) {
+        sha256_update(&ctx, buf, n);
+    }
+    fclose(fp);
+    sha256_final(&ctx, hash);
+}
+
+static void sha256_print(const uint8_t *hash) {
+    for (int i = 0; i < SHA256_DIGEST_SIZE; i++) {
+        printf("%02x", hash[i]);
+    }
+    printf("\n");
+}
 
 static uint64_t WHEEL_MOD = 210;
 static uint64_t WHEEL_SIZE = 48;
@@ -560,7 +714,8 @@ static void extend_base_primes(u128 limit) {
  * number via: block = number / 210, residue = number % 210.
  */
 static void process_segment(FILE *state_fp, u128 seg_start, u128 seg_end,
-                            FILE *output_fp) {
+                            FILE *output_fp, bool do_hash_output,
+                            SHA256_CTX *hash_ctx, FILE *hash_output_fp) {
     if (seg_start > seg_end) return;
 
     uint64_t first_block = (uint64_t)(seg_start / WHEEL_MOD);
@@ -656,6 +811,29 @@ static void process_segment(FILE *state_fp, u128 seg_start, u128 seg_end,
             if (output_fp) {
                 print_u128_f(output_fp, n);
                 fputc('\n', output_fp);
+            }
+            if (do_hash_output) {
+                char buf[64];
+                int len = 0;
+                u128 p = n;
+                if (p == 0) {
+                    buf[len++] = '0';
+                } else {
+                    char tmp[64];
+                    int tmp_len = 0;
+                    while (p > 0) {
+                        tmp[tmp_len++] = '0' + (char)(p % 10);
+                        p /= 10;
+                    }
+                    for (int k = tmp_len - 1; k >= 0; k--) {
+                        buf[len++] = tmp[k];
+                    }
+                }
+                buf[len++] = '\n';
+                sha256_update(hash_ctx, (uint8_t*)buf, len);
+                if (hash_output_fp) {
+                    fwrite(buf, 1, len, hash_output_fp);
+                }
             }
 
             u128 start_m = n * n;
@@ -763,6 +941,8 @@ int main(int argc, char **argv) {
     u128 target = 0;
     u128 buffer_size = 0;
     char *output_filename = NULL;
+    char *hash_output_filename = NULL;
+    char *verify_hash_filename = NULL;
     int count_only = 0;
     int report_mode = 0;
     int save_state = 0;
@@ -785,6 +965,12 @@ int main(int argc, char **argv) {
         } else if (strcmp(argv[i], "-o") == 0) {
             if (i + 1 < argc) output_filename = argv[++i];
             else { fprintf(stderr, "-o requires a filename\n"); return 1; }
+        } else if (strcmp(argv[i], "--hash-output") == 0) {
+            if (i + 1 < argc) hash_output_filename = argv[++i];
+            else { fprintf(stderr, "--hash-output requires a filename\n"); return 1; }
+        } else if (strcmp(argv[i], "--verify-hash") == 0) {
+            if (i + 1 < argc) verify_hash_filename = argv[++i];
+            else { fprintf(stderr, "--verify-hash requires a filename\n"); return 1; }
         } else if (argv[i][0] == '-') {
             fprintf(stderr, "Unknown option: %s\n", argv[i]);
             print_help();
@@ -806,6 +992,65 @@ int main(int argc, char **argv) {
     if (report_mode && (count_only || save_state || resume_mode)) {
         fprintf(stderr, "-r cannot be combined with -c, -s, or -R\n");
         return 1;
+    }
+
+    if (hash_output_filename && verify_hash_filename) {
+        fprintf(stderr, "--hash-output and --verify-hash cannot be combined\n");
+        return 1;
+    }
+    if (hash_output_filename && count_only) {
+        fprintf(stderr, "--hash-output cannot be combined with -c\n");
+        return 1;
+    }
+    if (verify_hash_filename && count_only) {
+        fprintf(stderr, "--verify-hash cannot be combined with -c\n");
+        return 1;
+    }
+    if (verify_hash_filename && hash_output_filename) {
+        fprintf(stderr, "--verify-hash cannot be combined with --hash-output\n");
+        return 1;
+    }
+    if (verify_hash_filename && report_mode) {
+        fprintf(stderr, "--verify-hash cannot be combined with -r\n");
+        return 1;
+    }
+    if (verify_hash_filename && resume_mode) {
+        fprintf(stderr, "--verify-hash cannot be combined with -R\n");
+        return 1;
+    }
+
+    if (verify_hash_filename) {
+        uint8_t computed_hash[SHA256_DIGEST_SIZE];
+        sha256_hash_file(verify_hash_filename, computed_hash);
+        char sha256_path[1024];
+        snprintf(sha256_path, sizeof(sha256_path), "%s.sha256", verify_hash_filename);
+        FILE *sha256_fp = fopen(sha256_path, "r");
+        if (!sha256_fp) {
+            fprintf(stderr, "Failed to open %s\n", sha256_path);
+            return 1;
+        }
+        char expected[256];
+        if (!fgets(expected, sizeof(expected), sha256_fp)) {
+            fprintf(stderr, "Failed to read from %s\n", sha256_path);
+            fclose(sha256_fp);
+            return 1;
+        }
+        fclose(sha256_fp);
+        char *space = strchr(expected, ' ');
+        if (space) *space = '\0';
+        size_t elen = strlen(expected);
+        while (elen > 0 && (expected[elen-1] == '\n' || expected[elen-1] == '\r' || expected[elen-1] == ' '))
+            expected[--elen] = '\0';
+        char computed_str[128];
+        int pos = 0;
+        for (int i = 0; i < SHA256_DIGEST_SIZE; i++)
+            pos += sprintf(computed_str + pos, "%02x", computed_hash[i]);
+        computed_str[pos] = '\0';
+        if (strcmp(computed_str, expected) == 0)
+            printf("Hash MATCHES: %s  %s\n", computed_str, verify_hash_filename);
+        else
+            printf("Hash MISMATCH:\n  Computed: %s\n  Expected: %s\n", computed_str, expected);
+        return 0;
     }
 
     if (report_mode) {
@@ -974,6 +1219,27 @@ int main(int argc, char **argv) {
     }
 
     FILE *output_fp = NULL;
+    FILE *hash_output_fp = NULL;
+    SHA256_CTX hash_ctx;
+    bool do_hash_output = false;
+    char hash_output_filename_with_ext[1024];
+
+    if (hash_output_filename) {
+        do_hash_output = true;
+        sha256_init(&hash_ctx);
+        if (strcmp(hash_output_filename, "-") == 0) {
+            hash_output_fp = stdout;
+        } else {
+            hash_output_fp = fopen(hash_output_filename, "w");
+            if (!hash_output_fp) {
+                perror("Failed to open hash output file");
+                if (state_fp) fclose(state_fp);
+                goto fail;
+            }
+            snprintf(hash_output_filename_with_ext, sizeof(hash_output_filename_with_ext), "%s.sha256", hash_output_filename);
+        }
+    }
+
     if (output_filename) {
         if (strcmp(output_filename, "-") == 0) {
             output_fp = stdout;
@@ -982,6 +1248,7 @@ int main(int argc, char **argv) {
             if (!output_fp) {
                 perror("Failed to open output file");
                 if (state_fp) fclose(state_fp);
+                if (hash_output_fp && hash_output_fp != stdout) fclose(hash_output_fp);
                 goto fail;
             }
         }
@@ -1021,6 +1288,29 @@ int main(int argc, char **argv) {
                 print_u128_f(output_fp, (u128)wheel_primes[i]);
                 fputc('\n', output_fp);
             }
+            if (do_hash_output) {
+                char buf[64];
+                int len = 0;
+                u128 p = (u128)wheel_primes[i];
+                if (p == 0) {
+                    buf[len++] = '0';
+                } else {
+                    char tmp[64];
+                    int tmp_len = 0;
+                    while (p > 0) {
+                        tmp[tmp_len++] = '0' + (char)(p % 10);
+                        p /= 10;
+                    }
+                    for (int k = tmp_len - 1; k >= 0; k--) {
+                        buf[len++] = tmp[k];
+                    }
+                }
+                buf[len++] = '\n';
+                sha256_update(&hash_ctx, (uint8_t*)buf, len);
+                if (hash_output_fp) {
+                    fwrite(buf, 1, len, hash_output_fp);
+                }
+            }
         }
         first_segment_start = last_wheel_prime + 1;
         /* Initial checkpoint right after wheel primes */
@@ -1053,7 +1343,8 @@ int main(int argc, char **argv) {
         u128 seg_end = current + buffer_size - 1;
         if (seg_end > target) seg_end = target;
 
-        process_segment(state_fp, current, seg_end, output_fp);
+        process_segment(state_fp, current, seg_end, output_fp,
+                        do_hash_output, &hash_ctx, hash_output_fp);
 
         /* Periodic checkpoint (every 10 segments) so a crash loses
          * at most 10 segments of progress. */
@@ -1084,6 +1375,28 @@ int main(int argc, char **argv) {
         fclose(state_fp);
     }
     if (output_fp) fclose(output_fp);
+
+    if (do_hash_output) {
+        uint8_t hash[SHA256_DIGEST_SIZE];
+        sha256_final(&hash_ctx, hash);
+        if (hash_output_fp && hash_output_fp != stdout) {
+            char sha256_path[1024];
+            snprintf(sha256_path, sizeof(sha256_path), "%s.sha256", hash_output_filename);
+            FILE *sha256_fp = fopen(sha256_path, "w");
+            if (sha256_fp) {
+                for (int i = 0; i < SHA256_DIGEST_SIZE; i++)
+                    fprintf(sha256_fp, "%02x", hash[i]);
+                fprintf(sha256_fp, "  %s\n", hash_output_filename);
+                fclose(sha256_fp);
+                printf("Hash written to %s\n", sha256_path);
+            }
+        } else {
+            sha256_print(hash);
+        }
+    }
+
+    if (hash_output_fp && hash_output_fp != stdout)
+        fclose(hash_output_fp);
 
     free(base);
     free(aren.base);
