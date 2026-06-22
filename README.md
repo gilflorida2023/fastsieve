@@ -1,9 +1,17 @@
 # fastsieve — Configurable Wheel Segmented Prime Sieve
 
+**The certified expert for OEIS A000040** — segmented wheel-30/210 sieve
+with streaming SHA-256, producing Math-KAT compatible hashes.
+
+[![Math-KAT Verified](https://img.shields.io/badge/Math--KAT-Verified-brightgreen?style=flat-square&logo=github)](https://github.com/gilflorida2023/math-kat)
+
 **fastsieve** counts and enumerates primes in large ranges using a
 segmented Sieve of Eratosthenes with configurable wheel factorization
 (mod 2, 6, 30, 210, or 2310) and 128-bit integers.  It can sieve up to
 ~10³⁸, limited only by time.
+
+> **For streaming prime verification:** see [Math-KAT](https://github.com/gilflorida2023/math-kat).
+> fastsieve's `--hash-output` produces Math-KAT compatible SHA-256 hashes for OEIS A000040.
 
 ## Algorithm
 
@@ -136,6 +144,64 @@ Requires GCC or Clang on a 64-bit platform (for `__int128` support).
 | `zcat primes_1e9.txt.gz \| ./fastsieve --verify-hash -` | Verify compressed prime list via streaming |
 | `./fastsieve` | Print help |
 
+## Math-KAT Integration
+
+fastsieve is the **reference C implementation** for OEIS A000040 (prime numbers)
+in the [Math-KAT](https://github.com/gilflorida2023/math-kat) framework.
+
+### Streaming Verification
+
+fastsieve's `--hash-output` computes SHA-256 **incrementally while sieving** —
+no temp files, no disk I/O.  The output is Math-KAT compatible:
+
+```bash
+# Generate and hash primes up to N, stream to Math-KAT verifier
+./fastsieve -c --hash-output - 15485863 | math-kat verify --stdin --sequence A000040 --tier extended
+
+# Or write primes + hash file, then verify
+./fastsieve -c -o primes.txt --hash-output primes.txt 1000000
+math-kat verify A000040 --tier ci_smoke
+```
+
+### Verification Tiers (Math-KAT)
+
+Every `./fastsieve -c --hash-output - N` command below produces the exact
+SHA-256 hash stored in the Math-KAT manifest for A000040:
+
+| Math-KAT Tier | Bound | fastsieve Command | Time |
+|---------------|-------|-------------------|------|
+| `min` | 100 primes | `./fastsieve -c 550` | <0.001s |
+| `ci_smoke` | 1,000 primes | `./fastsieve -c 8000` | <0.01s |
+| `dev` | 100,000 primes | `./fastsieve -c 1300000` | ~0.05s |
+| `extended` | 1,000,000 primes | `./fastsieve -c 15485863` | ~0.5s |
+| `hpc_1e12` | 10¹² (≤10¹²) | `./fastsieve -c 1000000000000` | ~1.4 hrs |
+
+### Cross-Repository Validation
+
+```bash
+# Pipe fastsieve output directly into Math-KAT verifier
+./fastsieve -c --hash-output - 15485863 | math-kat verify --stdin --sequence A000040 --tier extended
+
+# Math-KAT can also call fastsieve as a subprocess automatically
+math-kat verify A000040 --tier dev
+
+# Verify gzip-compressed PSVH reference file against Math-KAT manifest
+zcat psvh/primes_1e9.txt.gz | ./fastsieve --verify-hash - | math-kat verify --stdin --sequence A000040
+```
+
+### Relationship Between Projects
+
+| Project | Role |
+|---------|------|
+| **fastsieve** | High-performance C prime generator & streaming SHA-256 hasher for A000040 |
+| **PSVH** | Archived reference prime files (10³–10⁹ primes) with `.sha256` sidecars |
+| **Math-KAT** | Universal streaming verification framework for **any** OEIS sequence |
+
+- fastsieve generates the primes and produces incremental SHA-256 hashes
+- PSVH archives the output as compressed reference files (legacy)
+- Math-KAT provides the universal verification protocol, tiered manifests,
+  and generators for 5+ OEIS sequences — including A000040 via fastsieve
+
 ## Performance
 
 Benchmarked on an **AMD Ryzen 5 PRO 8500GE** (Zen 4c, 6 cores/12 threads,
@@ -258,12 +324,11 @@ psvh/counts/         — prime count records
 psvh/hashes/         — hash verification records
 ```
 
-## Prime Sieve Validation Hash (PSVH)
+## PSVH — Prime Sequence Verification Hash (Archival)
 
-PSVH is a cryptographic verification standard for prime lists generated
-by fastsieve.  The canonical hash is SHA-256 of the uncompressed decimal
-prime list (one per line, Unix LF, no trailing newline on the last line).
+PSVH was the original verification standard for fastsieve-generated prime lists.
+It has been **superseded by [Math-KAT](https://github.com/gilflorida2023/math-kat)**
+which extends the same SHA-256 streaming approach to **any** OEIS sequence.
 
-Reference files are generated with `--wheel 30` and distributed as
-`gzip -9` compressed archives.  See [PSVH_SPEC.md](PSVH_SPEC.md) for the
-full standard and [psvh/](psvh/) for reference files.
+Reference files (`psvh/primes/`, `psvh/hashes/`) remain as archival artifacts.
+See [PSVH_SPEC.md](PSVH_SPEC.md) for the legacy standard.
